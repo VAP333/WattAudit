@@ -1,0 +1,22 @@
+# Core
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+matplotlib==3.9.2
+seaborn==0.13.2
+joblib==1.4.2
+
+# Dashboard
+streamlit==1.38.0
+
+# Optimization / ML Tuning
+optuna==3.6.1
+
+# Utilities
+watchdog==4.0.2
+deep-translator==1.11.4   # for Hindi/Marathi translations
+
+# Optional (logging, progress, formatting)
+rich==13.9.4
+tenacity==8.5.0
+protobuf==5.29.5
