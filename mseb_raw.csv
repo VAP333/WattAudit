@@ -1,0 +1,7 @@
+ConsumerID,BillMonth,UnitsConsumed,UnitsBilled,Category
+1001,01-01-25,350,340,Residential
+1002,01-01-25,520,500,Commercial
+1003,01-01-25,120,150,Residential
+1001,01-02-25,400,380,Residential
+1002,01-02-25,480,500,Commercial
+1003,01-02-25,130,100,Residential

@@ -1,10 +1,11 @@
-# train_model.py (with tuned parameters + synthetic anomaly injection)
+# train_model.py (improved hybrid anomaly logic + persistence + normalization)
 
 import os
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import MinMaxScaler
 import joblib
 from utils.synthetic import inject_synthetic_anomalies_per_customer  # ✅ use utility
 
@@ -58,7 +59,6 @@ else:
         "max_samples": 0.8,
         "lof_n_neighbors": 20,
         "lof_contamination": 0.05,
-        "rule_cutoff": 0.85,
         "alpha": 0.5,
     }
 
@@ -80,18 +80,43 @@ lof = LocalOutlierFactor(
 )
 df["lof_pred"] = lof.fit_predict(X)
 
-# --------- Step 5: Hybrid Scoring ---------
-alpha = best_params["alpha"]
-df["combined_score"] = alpha * df["iso_score"] + (1 - alpha) * df["lof_pred"]
-df["rule_flag"] = (df["ratio"] < best_params["rule_cutoff"]).astype(int)
-df["final_score"] = df["combined_score"] - df["rule_flag"] * 2
+# --------- Step 5: Improved Hybrid Scoring ---------
+scaler = MinMaxScaler()
+df["iso_norm"] = scaler.fit_transform(df[["iso_score"]])
+df["lof_norm"] = scaler.fit_transform(np.abs(df[["lof_pred"]]))  # LOF outputs -1/1 → abs makes consistent
+
+alpha = best_params.get("alpha", 0.5)
+df["combined_score"] = alpha * df["iso_norm"] + (1 - alpha) * df["lof_norm"]
+
+# --- Rule-based anomaly (both under & over billing) ---
+under_flag = (df["ratio"] < 0.85).astype(int)
+over_flag = (df["ratio"] > 1.3).astype(int)
+df["rule_flag"] = under_flag | over_flag
+
+# --- Penalize rule-based issues mildly since normalized ---
+df["final_score"] = df["combined_score"] - df["rule_flag"] * 0.2
+
+# --- Label anomalies: lowest 5% as anomalies ---
+threshold = df["final_score"].quantile(0.05)
+df["anomaly_label"] = (df["final_score"] < threshold).astype(int)
+
+# --- Persistence filter: anomaly in 2+ consecutive months ---
+df["persistent_anomaly"] = (
+    df.groupby("customer_id")["anomaly_label"]
+    .rolling(2)
+    .sum()
+    .reset_index(0, drop=True)
+    .ge(2)
+    .astype(int)
+)
 
 # --------- Step 6: Save Outputs ---------
-# Top 50 suspicious customers
+# Top 50 suspicious customers (based on persistence first)
 top50 = (
-    df.groupby("customer_id")["final_score"]
+    df.groupby("customer_id")["persistent_anomaly"]
     .mean()
-    .nsmallest(50)
+    .sort_values(ascending=False)
+    .head(50)
     .reset_index()
 )
 top50.to_csv(os.path.join(DATA_DIR, "top50_suspicious_customers.csv"), index=False)
@@ -107,3 +132,4 @@ print(f"✅ Model saved to {os.path.join(MODEL_DIR, 'anomaly_model.pkl')}")
 print(f"✅ Top 50 suspicious customers saved to {os.path.join(DATA_DIR, 'top50_suspicious_customers.csv')}")
 print(f"✅ Training dataset with synthetics saved to {os.path.join(DATA_DIR, 'training_with_synthetics.csv')}")
 print(f"⚡ Injected {df['is_synthetic'].sum()} synthetic anomalies for training.")
+print("✅ Improved anomaly logic: normalized, under+over billing handled, persistence check added.")
