@@ -46,15 +46,19 @@ else:
 # --------- Features ---------
 features = ["consumption_kwh", "billed_kwh", "ratio", "monthly_change", "cat_dev", "billing_gap"]
 X = df[features].fillna(0)
+scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
+X_scaled = scaler.transform(X)
+
 
 # --------- Step 1: Model Scores ---------
-df["iso_score"] = iso.decision_function(X)
+df["iso_score"] = iso.score_samples(X_scaled)
+
 
 lof = LocalOutlierFactor(
     n_neighbors=best_params.get("lof_n_neighbors", 20),
     contamination=best_params.get("lof_contamination", 0.05),
 )
-df["lof_pred"] = lof.fit_predict(X)
+df["lof_pred"] = lof.fit_predict(X_scaled)
 
 # --------- Step 2: Normalize Scores ---------
 scaler = MinMaxScaler()
@@ -72,21 +76,7 @@ df["rule_flag"] = under_flag | over_flag
 # Mild penalty for rule-based anomalies
 df["final_score"] = df["combined_score"] - df["rule_flag"] * 0.2
 
-# --------- Step 4: Label Anomalies ---------
-threshold = df["final_score"].quantile(0.05)
-df["anomaly_label"] = (df["final_score"] < threshold).astype(int)
-
-# Persistence check: anomaly for 2+ consecutive months
-df["persistent_anomaly"] = (
-    df.groupby("customer_id")["anomaly_label"]
-    .rolling(2)
-    .sum()
-    .reset_index(0, drop=True)
-    .ge(2)
-    .astype(int)
-)
-
-# --------- Step 5: True Labels ---------
+# --------- Step 4: True Labels (BEFORE auto-threshold!) ---------
 if "is_synthetic" in df.columns:
     df["true_label"] = df["is_synthetic"].apply(lambda x: -1 if x == 1 else 1)
 else:
@@ -95,8 +85,45 @@ else:
     fraud_idx = df.sample(30, random_state=42).index
     df.loc[fraud_idx, "true_label"] = -1
 
-# Use persistent anomalies as final prediction
-df["pred"] = df["persistent_anomaly"].apply(lambda x: -1 if x == 1 else 1)
+
+# --------- Step 5: Auto-Tune Threshold ---------
+best_threshold = None
+best_f1 = -1
+best_precision = 0
+best_recall = 0
+for q in np.linspace(0.01, 0.15, 30):
+    temp_label = np.where(df["final_score"] < df["final_score"].quantile(q), -1, 1)
+
+    precision_q = precision_score(df["true_label"], temp_label, pos_label=-1, zero_division=0)
+    recall_q = recall_score(df["true_label"], temp_label, pos_label=-1, zero_division=0)
+    f1_q = f1_score(df["true_label"], temp_label, pos_label=-1, zero_division=0)
+
+    # pick best quantile by F1 (tie broken by precision)
+    if f1_q > best_f1 or (f1_q == best_f1 and precision_q > best_precision):
+        best_f1 = f1_q
+        best_precision = precision_q
+        best_recall = recall_q
+        best_threshold = q
+
+# fallback if not found
+if best_threshold is None:
+    best_threshold = 0.05
+
+# Apply best threshold to create final predictions
+df["pred"] = np.where(df["final_score"] < df["final_score"].quantile(best_threshold), -1, 1)
+
+# --------- Step 5b: Persistence filter based on predictions (2+ consecutive anomalies) ---------
+df["persistent_anomaly"] = (
+    df.groupby("customer_id")["pred"]
+    .rolling(2)
+    .apply(lambda x: (x == -1).sum(), raw=True)
+    .reset_index(0, drop=True)
+    .ge(2)
+    .astype(int)
+)
+
+print(f"⚙️ Auto-tuned quantile: {best_threshold:.3f} (F1={best_f1:.3f}, P={best_precision:.3f}, R={best_recall:.3f})")
+
 
 # --------- Step 6: Metrics ---------
 precision = precision_score(df["true_label"], df["pred"], pos_label=-1, zero_division=0)

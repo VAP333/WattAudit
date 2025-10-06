@@ -1,4 +1,4 @@
-# tune_and_train.py (hybrid normalized scoring + persistence-aware grid search)
+# tune_and_train.py (updated hybrid normalized scoring + persistence-aware grid search)
 
 import os
 import json
@@ -28,8 +28,15 @@ if not os.path.exists(training_with_synthetics_path):
 df = pd.read_csv(training_with_synthetics_path, parse_dates=["month"])
 print(f"✅ Loaded {len(df)} records from training_with_synthetics.csv")
 
-features = ["consumption_kwh", "billed_kwh", "ratio", "monthly_change", "cat_dev", "billing_gap"]
-X = df[features].fillna(0)
+FEATURES = [
+    "consumption_kwh",
+    "billed_kwh",
+    "ratio",
+    "monthly_change",
+    "cat_dev",
+    "billing_gap",
+]
+X = df[FEATURES].fillna(0)
 y_true = df["is_synthetic"].apply(lambda x: -1 if x == 1 else 1).values
 
 # ---------- Helper Functions ----------
@@ -42,7 +49,8 @@ def evaluate_combo(X, df, params):
         max_samples=params["max_samples"],
         random_state=42
     )
-    iso_scores = iso.fit(X).decision_function(X)
+    # ✅ Use score_samples instead of decision_function
+    iso_scores = iso.fit(X).score_samples(X)
 
     # --- LOF (novelty=True for stable scoring) ---
     lof = LocalOutlierFactor(
@@ -153,6 +161,11 @@ print("\n🏆 Best Parameters Found:")
 for k, v in best_params.items():
     print(f"  {k}: {v}")
 
+# ✅ Save the scaler for inference consistency
+scaler = MinMaxScaler()
+scaler.fit(X)
+joblib.dump(scaler, os.path.join(MODEL_DIR, "scaler.pkl"))
+
 joblib.dump(best_params, os.path.join(MODEL_DIR, "best_params.pkl"))
 joblib.dump(best["iso"], os.path.join(MODEL_DIR, "best_isolation_forest.pkl"))
 
@@ -169,6 +182,6 @@ meta = {
 with open(os.path.join(MODEL_DIR, "best_model_meta.json"), "w") as f:
     json.dump(meta, f, indent=2)
 
-print("\n✅ Best model and metadata saved.")
+print("\n✅ Best model, scaler, and metadata saved.")
 print("🎯 Best metrics:", meta["best_metrics"])
 print("⚡ Hybrid logic: normalized IF+LOF, dual rule thresholds, persistence-aware F1.")

@@ -1,4 +1,4 @@
-# tune_model.py (hybrid normalized scoring + persistence-aware tuning)
+# tune_model.py (updated hybrid normalized scoring + persistence-aware tuning)
 
 import os
 import pandas as pd
@@ -16,9 +16,20 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+# -------- Load Data --------
 df = pd.read_csv(os.path.join(DATA_DIR, "training_with_synthetics.csv"))
-features = ["consumption_kwh", "billed_kwh", "ratio", "monthly_change", "cat_dev", "billing_gap"]
-X = df[features].fillna(0)
+
+FEATURES = [
+    "consumption_kwh",
+    "billed_kwh",
+    "ratio",
+    "monthly_change",
+    "cat_dev",
+    "billing_gap",
+]
+X = df[FEATURES].fillna(0)
+
+# Synthetic anomalies = -1, normal = 1
 y = df["is_synthetic"].apply(lambda x: -1 if x == 1 else 1)
 
 # -------- Objective Function --------
@@ -40,7 +51,8 @@ def objective(trial):
         max_samples=max_samples,
         random_state=42
     )
-    iso_scores = iso.fit(X).decision_function(X)
+    # ✅ Use score_samples for consistent scoring direction (higher = more anomalous)
+    iso_scores = iso.fit(X).score_samples(X)
 
     # -------- LOF (novelty=True for scoring consistency) --------
     lof = LocalOutlierFactor(

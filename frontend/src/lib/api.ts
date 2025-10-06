@@ -16,6 +16,7 @@ export async function getLive(limit = 100) {
   return res.ok ? res.json() : { error: await res.text() };
 }
 
+
 export async function predict(payload: {
   consumption_kwh: number;
   billed_kwh: number;

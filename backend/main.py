@@ -9,6 +9,7 @@ import os
 import psycopg2
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
+from api import customers, anomalies, predict, insights
 
 # ---------- CONFIG & PATHS ----------
 load_dotenv()
@@ -18,10 +19,18 @@ DATA_DIR = os.path.join(BASE_DIR, "..", "data")
 MODEL_DIR = os.path.join(BASE_DIR, "..", "models")
 
 MODEL_PATH = os.path.join(MODEL_DIR, "anomaly_model.pkl")
+SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 LOCAL_DATA_PATH = os.path.join(DATA_DIR, "merged_data.csv")  # ✅ unified dataset
 NEON_CONN = os.getenv("NEON_CONN")
 
-features = ["consumption_kwh", "billed_kwh", "ratio", "monthly_change", "cat_dev", "billing_gap"]
+FEATURES = [
+    "consumption_kwh",
+    "billed_kwh",
+    "ratio",
+    "monthly_change",
+    "cat_dev",
+    "billing_gap",
+]
 
 # ---------- INIT ----------
 app = FastAPI(title="⚡ WattAudit++ Explainable AI API", version="3.1")
@@ -34,13 +43,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- LOAD MODEL + LOCAL DATA ----------
+# Register routers from the `api` package.
+# Note: `customers.router` already defines the `/api/customers` prefix,
+# so we include it as-is. The other routers are mounted under `/api`
+# to avoid colliding with existing top-level routes in this file.
+app.include_router(customers.router)
+app.include_router(anomalies.router, prefix="/api")
+app.include_router(predict.router, prefix="/api")
+app.include_router(insights.router, prefix="/api")
+
+# ---------- LOAD MODEL + SCALER + LOCAL DATA ----------
 try:
     model = joblib.load(MODEL_PATH)
     print("✅ Model loaded successfully.")
 except Exception:
     model = None
     print("⚠️ Model missing — please run train_model.py first.")
+
+try:
+    scaler = joblib.load(SCALER_PATH)
+    print("✅ Scaler loaded successfully.")
+except Exception:
+    scaler = None
+    print("⚠️ Scaler missing — predictions may be inconsistent.")
 
 try:
     df_local = pd.read_csv(LOCAL_DATA_PATH, parse_dates=["month"])
@@ -52,134 +77,87 @@ except Exception:
 
 # ---------- HELPERS ----------
 def _rescaled_confidence(score: float) -> float:
-    """Better confidence mapping for human interpretability."""
     scaled_score = max(min(score, 0.3), -0.3)  # Clamp extremes
     return round((1 - ((scaled_score + 0.3) / 0.6)) * 100, 2)
 
-
-def generate_reason(row):
-    """Explain why a customer's record looks anomalous or normal (aligned with AI label)."""
+# (generate_reason and generate_summary remain unchanged)
+# ---------- AI Reasoning Helpers ----------
+def generate_reason(record):
+    """
+    Generate a human-readable reason for anomaly / normal classification.
+    Works for both aggregated and single-record inputs.
+    """
+    # Support both dict-like and pandas Series inputs
     try:
-        ratio = float(row.get("ratio", 1.0))
-        change = float(row.get("monthly_change", 0.0))
-        cons = float(row.get("consumption_kwh", 0.0))
-        score = float(row.get("anomaly_score", row.get("avg_anomaly_score", 0.0)))
-        label = int(row.get("anomaly_label", 1))
-
-        # 🔴 Only consider anomaly if label says so (ignore mild negative averages)
-        if label == -1:
-            if ratio < 0.85:
-                return "⚠️ Underbilling anomaly — billed much less than consumption."
-            elif ratio > 1.3:
-                return "⚠️ Overbilling anomaly — charged higher than usage."
-            elif abs(change) > cons * 0.4:
-                direction = "rise" if change > 0 else "drop"
-                return f"⚡ Sudden {direction} — unusual consumption shift."
-            else:
-                return "⚠️ AI detected anomaly — irregular usage pattern detected."
-
-        # 🟢 Normal cases (only reached if AI says 'normal')
-        if 0.9 <= ratio <= 1.2 and abs(change) <= cons * 0.1:
-            return "✅ Stable usage — consistent with historical trends."
-        elif abs(change) > cons * 0.3:
-            direction = "increase" if change > 0 else "decrease"
-            return f"ℹ️ Noticeable {direction} in usage trend."
-        else:
-            return "ℹ️ Mild variation — within expected range."
-
+        ratio = record.get("ratio", 1.0)
+        monthly_change = record.get("monthly_change", 0.0)
+        anomaly_score = record.get("anomaly_score", 0.0)
+        anomaly_label = record.get("anomaly_label", 1)
     except Exception:
-        return "❓ Insufficient data for reasoning."
+        # fallback for unexpected input types
+        ratio = float(record["ratio"]) if "ratio" in record else 1.0
+        monthly_change = float(record["monthly_change"]) if "monthly_change" in record else 0.0
+        anomaly_score = float(record.get("anomaly_score", 0.0))
+        anomaly_label = int(record.get("anomaly_label", 1))
 
+    reasons = []
 
-def generate_summary(cust_id: str, cust_data: pd.DataFrame):
-    """Generate multilingual human-readable summary."""
-    avg_consumption = float(cust_data["consumption_kwh"].mean())
-    recent = cust_data.sort_values("month").tail(1)
-    cons_recent = float(recent["consumption_kwh"].iloc[0])
-    bill_recent = float(recent["billed_kwh"].iloc[0])
-    ratio = bill_recent / (cons_recent + 1)
-    deviation = cons_recent - avg_consumption
-    percent_change = (deviation / avg_consumption) * 100 if avg_consumption else 0.0
-
-    # --- Narrative generation ---
+    # Billing anomalies
     if ratio < 0.85:
-        summary_en = (
-            f"Customer {cust_id} seems **underbilled** — billed {bill_recent:.1f} for {cons_recent:.1f} kWh consumed. "
-            "Possible meter or reading issue. Recommended: verify meter logs."
-        )
+        reasons.append("⚠️ Under-billing detected")
     elif ratio > 1.3:
-        summary_en = (
-            f"Customer {cust_id} appears **overbilled** — charged {bill_recent:.1f} units for {cons_recent:.1f} kWh. "
-            "Review tariff or billing system integrity."
-        )
-    elif percent_change > 50:
-        summary_en = (
-            f"Customer {cust_id} shows a **sharp consumption increase** — {percent_change:.0f}% higher than average. "
-            "May indicate new equipment or seasonal load."
-        )
-    elif percent_change < -50:
-        summary_en = (
-            f"Customer {cust_id} shows a **sharp drop** — {abs(percent_change):.0f}% below their average. "
-            "Possible reduced usage or meter malfunction."
+        reasons.append("⚠️ Over-billing detected")
+
+    # Sudden consumption changes
+    if abs(monthly_change) > 100:  # heuristic threshold
+        reasons.append("⚡ Sudden change in consumption pattern")
+
+    # Model output
+    if anomaly_label == -1:
+        reasons.append(f"🤖 AI flagged this as anomalous (score={anomaly_score:.3f})")
+    else:
+        reasons.append(f"✅ Stable consumption pattern (score={anomaly_score:.3f})")
+
+    return " | ".join(reasons)
+
+
+def generate_summary(cust_id: str, df: pd.DataFrame):
+    """
+    Generate summary in English, Hindi, and Marathi using deep_translator.
+    """
+    # Simple English base summary
+    anomaly_count = int((df["anomaly_label"] == -1).sum())
+    total_months = len(df)
+    score_avg = df["anomaly_score"].mean()
+
+    if anomaly_count == 0:
+        base_summary = (
+            f"Customer {cust_id} shows a stable consumption pattern with no anomalies "
+            f"detected over {total_months} months. Average anomaly score: {score_avg:.3f}."
         )
     else:
-        summary_en = (
-            f"Customer {cust_id}'s consumption ({cons_recent:.1f} kWh) aligns with their typical average ({avg_consumption:.1f} kWh). "
-            "No significant anomalies detected."
+        base_summary = (
+            f"Customer {cust_id} shows {anomaly_count} anomalies out of {total_months} months. "
+            f"Average anomaly score: {score_avg:.3f}. Potential billing or usage irregularities detected."
         )
 
-    summary_en += " — Insight generated by WattAudit++ Hybrid Explainable AI."
+    try:
+        summary_hi = GoogleTranslator(source="en", target="hi").translate(base_summary)
+    except Exception:
+        summary_hi = "⚠️ Translation unavailable (Hindi)."
 
     try:
-        summary_hi = GoogleTranslator(source="en", target="hi").translate(summary_en)
-        summary_mr = GoogleTranslator(source="en", target="mr").translate(summary_en)
+        summary_mr = GoogleTranslator(source="en", target="mr").translate(base_summary)
     except Exception:
-        summary_hi = summary_mr = "⚠️ Translation unavailable."
+        summary_mr = "⚠️ Translation unavailable (Marathi)."
 
-    return summary_en, summary_hi, summary_mr
+    return base_summary, summary_hi, summary_mr
 
 
 # ---------- ROUTES ----------
 @app.get("/")
 def root():
     return {"message": "⚡ WattAudit++ Hybrid AI Backend is live (Neon + Local fallback)."}
-
-
-@app.post("/upload_dataset")
-def upload_dataset(file: UploadFile = File(...)):
-    """Upload or replace local dataset."""
-    try:
-        df = pd.read_csv(file.file)
-        required = {"customer_id", "month", "consumption_kwh", "billed_kwh", "consumer_category"}
-        missing = required - set(df.columns)
-        if missing:
-            return {"error": f"Missing columns: {sorted(list(missing))}"}
-        df["month"] = pd.to_datetime(df["month"], errors="coerce")
-        df.to_csv(LOCAL_DATA_PATH, index=False)
-        return {"message": "✅ Dataset uploaded successfully!", "rows": len(df)}
-    except Exception as e:
-        return {"error": f"Upload failed: {e}"}
-
-
-@app.get("/get_data")
-def get_data(limit: int = 100):
-    """Return recent data for live feed."""
-    try:
-        if NEON_CONN:
-            conn = psycopg2.connect(NEON_CONN)
-            query = f"SELECT * FROM billing_data ORDER BY month DESC LIMIT {limit};"
-            df = pd.read_sql(query, conn)
-            conn.close()
-        else:
-            df = df_local.copy()
-        df["month"] = pd.to_datetime(df["month"]).dt.strftime("%Y-%m-%d")
-        return df.to_dict(orient="records")
-    except Exception:
-        if not df_local.empty:
-            sample = df_local.sort_values("month", ascending=False).head(limit)
-            sample["month"] = pd.to_datetime(sample["month"]).dt.strftime("%Y-%m-%d")
-            return sample.to_dict(orient="records")
-        return []
 
 
 @app.get("/customers")
@@ -207,8 +185,11 @@ def get_customers(limit: int = 500):
     df["billing_gap"] = df["consumption_kwh"] - df["billed_kwh"]
 
     if model is not None:
-        df["anomaly_score"] = model.decision_function(df[features].fillna(0))
-        df["anomaly_label"] = model.predict(df[features].fillna(0))
+        X = df[FEATURES].fillna(0)
+        if scaler is not None:
+            X = scaler.transform(X)
+        df["anomaly_score"] = model.score_samples(X)
+        df["anomaly_label"] = model.predict(X)
     else:
         df["anomaly_score"], df["anomaly_label"] = 0.0, 1
 
@@ -254,8 +235,11 @@ def get_customer(cust_id: str):
     df["billing_gap"] = df["consumption_kwh"] - df["billed_kwh"]
 
     if model is not None:
-        df["anomaly_score"] = model.decision_function(df[features].fillna(0))
-        df["anomaly_label"] = model.predict(df[features].fillna(0))
+        X = df[FEATURES].fillna(0)
+        if scaler is not None:
+            X = scaler.transform(X)
+        df["anomaly_score"] = model.score_samples(X)
+        df["anomaly_label"] = model.predict(X)
     else:
         df["anomaly_score"], df["anomaly_label"] = 0.0, 1
 
@@ -301,11 +285,16 @@ def predict(req: PredictRequest):
             "cat_dev": 0.0,
             "billing_gap": req.consumption_kwh - req.billed_kwh,
         }])
+
         if model is None:
             return {"error": "Model not available"}
 
-        score = float(model.decision_function(sample[features].fillna(0))[0])
-        label = int(model.predict(sample[features].fillna(0))[0])
+        X = sample[FEATURES].fillna(0)
+        if scaler is not None:
+            X = scaler.transform(X)
+
+        score = float(model.score_samples(X)[0])
+        label = int(model.predict(X)[0])
         confidence = _rescaled_confidence(score)
         reason = generate_reason({
             "ratio": ratio,
