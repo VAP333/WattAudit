@@ -2,6 +2,7 @@
 
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import i18n from "@/i18n/client"; // ✅ ensures initialized React-i18next instance
 
 const LANGS = [
   { code: "en", label: "🇬🇧 English" },
@@ -10,22 +11,21 @@ const LANGS = [
 ];
 
 export default function LanguageSwitcher() {
-  const { i18n } = useTranslation();
+  const { i18n: i18nextInstance } = useTranslation();
 
   const handleChange = (lng: string) => {
-    i18n.changeLanguage(lng);
+    i18n.changeLanguage(lng); // ✅ call the imported initialized instance
     localStorage.setItem("i18nextLng", lng);
   };
 
   useEffect(() => {
     const savedLang = localStorage.getItem("i18nextLng");
-    if (savedLang && i18n.language !== savedLang) {
+    if (savedLang && i18nextInstance.language !== savedLang) {
       i18n.changeLanguage(savedLang);
     }
-  }, [i18n]);
+  }, [i18nextInstance]);
 
   return (
-    // 👇 Add suppressHydrationWarning here
     <div className="flex items-center gap-2" suppressHydrationWarning>
       {LANGS.map((lang) => (
         <button

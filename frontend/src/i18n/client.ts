@@ -1,10 +1,15 @@
-// frontend/src/i18n/client.ts
 "use client";
 
-import i18n from "./config";
+import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
+import LanguageDetector from "i18next-browser-languagedetector";
+import { i18nOptions } from "./config";
 
-// Initialize React bindings for i18next (client side only)
-i18n.use(initReactI18next).init();
+if (!i18n.isInitialized) {
+  i18n
+    .use(LanguageDetector)
+    .use(initReactI18next)
+    .init(i18nOptions);
+}
 
 export default i18n;

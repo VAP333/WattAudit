@@ -8,3 +8,7 @@ timestamp,precision,recall,f1_score,notes
 2025-10-06 20:10:52,0.055,0.047,0.051,Improved hybrid evaluation (normalized + persistence)
 2025-10-06 23:17:14,0.091,0.32,0.142,Improved hybrid evaluation (normalized + persistence)
 2025-10-06 23:52:26,0.091,0.32,0.142,Improved hybrid evaluation (normalized + persistence)
+2025-10-07 10:19:30,0.091,0.32,0.142,Improved hybrid evaluation (normalized + persistence)
+2025-10-07 16:13:48,0.091,0.32,0.142,Improved hybrid evaluation (normalized + persistence)
+2025-10-07 21:22:27,0.091,0.32,0.142,Improved hybrid evaluation (normalized + persistence)
+2025-10-07 21:25:04,0.091,0.32,0.142,Improved hybrid evaluation (normalized + persistence)

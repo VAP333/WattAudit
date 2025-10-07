@@ -100,4 +100,17 @@ copilot: {
   placeholder: "Ask in English / Hindi / Marathi...",
   thinking: "Copilot is thinking...",
 }
+,
+voice: {
+  listening: " Listening...",
+  unsupported: "Your browser does not support voice recognition.",
+  error: "There was a problem capturing your voice. Please try again."
+}
+,
+// Playback control labels
+playback: {
+  pause: "Pause",
+  resume: "Resume",
+  stop: "Stop"
+}
 };

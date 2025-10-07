@@ -1,4 +1,5 @@
-import "../i18n/config";
+import "@/i18n/config";
+
  // initializes i18n globally on the server
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";

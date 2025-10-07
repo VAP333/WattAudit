@@ -1,10 +1,11 @@
 "use client";
 
 import "@/i18n/client";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams } from "next/navigation";
 import { getCustomer } from "@/lib/api";
 import { useTranslation } from "react-i18next";
+import ReactMarkdown from "react-markdown";
 import {
   LineChart,
   Line,
@@ -39,6 +40,14 @@ interface CustomerResponse {
   error?: string;
 }
 
+// Global SpeechRecognition
+declare global {
+  interface Window {
+    SpeechRecognition: any;
+    webkitSpeechRecognition: any;
+  }
+}
+
 export default function CustomerDetail() {
   const params = useParams();
   const id = params?.id as string;
@@ -63,6 +72,134 @@ export default function CustomerDetail() {
   const [copilotInput, setCopilotInput] = useState("");
   const [isThinking, setIsThinking] = useState(false);
 
+  // voice / recognition states
+  const [isListening, setIsListening] = useState(false);
+  const [audioEnabled, setAudioEnabled] = useState(true);
+  const recognitionRef = useRef<any>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // --- TTS setup ---
+  const audioQueueRef = useRef<HTMLAudioElement[]>([]);
+  const isPlayingRef = useRef(false);
+
+  const cleanText = (s: string) =>
+    s.replace(/[*_#`~>]/g, "")
+      .replace(/\s{2,}/g, " ")
+      .replace(/\[(.*?)\]\(.*?\)/g, "$1")
+      .trim();
+
+  const clearAudioQueue = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      try {
+        URL.revokeObjectURL(audioRef.current.src);
+      } catch {}
+      audioRef.current = null;
+    }
+    while (audioQueueRef.current.length) {
+      const a = audioQueueRef.current.shift()!;
+      try {
+        URL.revokeObjectURL(a.src);
+      } catch {}
+    }
+    isPlayingRef.current = false;
+  };
+
+  const enqueueAudio = async (blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    const a = new Audio(url);
+    audioQueueRef.current.push(a);
+
+    const playNext = () => {
+      if (isPlayingRef.current) return;
+      const next = audioQueueRef.current.shift();
+      if (!next) return;
+      isPlayingRef.current = true;
+      audioRef.current = next;
+      next.onended = () => {
+        try {
+          URL.revokeObjectURL(next.src);
+        } catch {}
+        isPlayingRef.current = false;
+        audioRef.current = null;
+        playNext();
+      };
+      void next.play().catch(() => {
+        isPlayingRef.current = false;
+        audioRef.current = null;
+        playNext();
+      });
+    };
+
+    playNext();
+  };
+
+  // play TTS directly (after full response) — uses audioRef for pause/cleanup
+  const speakText = async (text: string) => {
+    if (!audioEnabled || !text.trim()) return;
+    try {
+      const cleaned = cleanText(text);
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: cleaned, lang: i18n.language }),
+      });
+      if (!res.ok) throw new Error("TTS failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      await audio.play();
+    } catch (err) {
+      console.warn("TTS error:", err);
+    }
+  };
+
+  const clearAudio = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      try { URL.revokeObjectURL(audioRef.current.src); } catch {}
+      audioRef.current = null;
+    }
+  }, []);
+
+  // language mapping for SpeechRecognition / TTS locale
+  const langMap: Record<string, string> = { en: "en-US", hi: "hi-IN", mr: "mr-IN" };
+  const getLocale = useCallback(() => langMap[i18n.language] || "en-US", [i18n.language]);
+
+  // SpeechRecognition helpers
+  const startRecognition = useCallback(() => {
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return alert(t("voice.unsupported"));
+    try { recognitionRef.current?.abort?.(); } catch {}
+    const r = new SR();
+    r.lang = getLocale();
+    r.interimResults = false;
+    r.maxAlternatives = 1;
+    r.onstart = () => setIsListening(true);
+    r.onresult = (ev: any) => {
+      const transcript = ev.results[0][0].transcript;
+      setCopilotInput(transcript);
+      setIsListening(false);
+    };
+    r.onerror = () => setIsListening(false);
+    r.onend = () => setIsListening(false);
+    try { r.start(); recognitionRef.current = r; } catch (err) {
+      console.warn("SR start failed", err);
+    }
+  }, [getLocale, t]);
+
+  const stopRecognition = useCallback(() => {
+    try { recognitionRef.current?.stop?.(); } catch {}
+    setIsListening(false);
+  }, []);
+
+  const toggleVoice = useCallback(() => {
+    if (isListening) stopRecognition();
+    else startRecognition();
+  }, [isListening, startRecognition, stopRecognition]);
+
   useEffect(() => {
     if (!id) return;
     (async () => {
@@ -74,42 +211,71 @@ export default function CustomerDetail() {
 
   const handleCopilotSend = async () => {
     if (!copilotInput.trim()) return;
-    const query = copilotInput;
-    setCopilotMessages((msgs) => [...msgs, { role: "user", text: query }]);
+    const q = copilotInput;
+    setCopilotMessages((m) => [...m, { role: "user", text: q }]);
     setCopilotInput("");
     setIsThinking(true);
+    setCopilotMessages((m) => [...m, { role: "bot", text: "" }]);
 
     try {
       const res = await fetch("/api/copilot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: `Customer ${id}: ${query}` }),
+        body: JSON.stringify({
+          query: q,
+          lang: i18n.language, // ensure the model replies in the selected language
+          customer_id: id,
+          summary: cust?.summary,
+          recent_data: cust?.records.slice(-6),
+        }),
       });
 
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("no reader");
+
+      const dec = new TextDecoder();
       let buffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        const chunk = dec.decode(value, { stream: true });
+        buffer += chunk;
+
         setCopilotMessages((msgs) => {
-          const updated = [...msgs];
-          updated[updated.length - 1] = { role: "bot", text: buffer };
-          return updated;
+          const copy = [...msgs];
+          const idx = copy.map((x) => x.role).lastIndexOf("bot");
+          if (idx >= 0) copy[idx] = { role: "bot", text: buffer };
+          return copy;
         });
       }
-    } catch (err) {
-      console.error("Copilot error:", err);
-      setCopilotMessages((msgs) => [
-        ...msgs,
-        { role: "bot", text: "⚠️ Error getting response" },
-      ]);
-    }
 
-    setIsThinking(false);
+      if (audioEnabled && buffer.trim().length) {
+        await speakText(buffer); // speak only after full message
+      }
+
+      setIsThinking(false);
+    } catch (err) {
+      console.error(err);
+      setCopilotMessages((m) => [...m, { role: "bot", text: t("copilot.error") }]);
+      setIsThinking(false);
+    }
   };
+
+  useEffect(() => {
+    if (!copilotOpen) clearAudio(); // stop any ongoing speech when assistant closes
+    const handleVisibilityChange = () => {
+      if (document.hidden) clearAudio(); // stop when tab is hidden
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [copilotOpen, clearAudio]);
+
+  // scroll to bottom when messages update
+  useEffect(() => {
+    if (messagesEndRef.current)
+      messagesEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [copilotMessages, isThinking]);
 
   if (loading) {
     return (
@@ -278,59 +444,110 @@ export default function CustomerDetail() {
         </div>
       </div>
 
-      {/* Copilot */}
-      <div className="fixed bottom-6 right-6 flex flex-col items-end space-y-2 z-50">
-        {copilotOpen && (
-          <div className="bg-white dark:bg-gray-800 shadow-lg rounded-lg w-80 max-h-[60vh] flex flex-col overflow-hidden animate-fade-in">
-            <div className="bg-gradient-to-r from-indigo-500 to-blue-500 text-white p-3 font-semibold flex justify-between items-center">
-              ⚡ WattAudit Copilot
-              <button onClick={() => setCopilotOpen(false)}>✖</button>
+      {/* Copilot Floating Assistant */}
+      <button
+        onClick={() => setCopilotOpen((s) => !s)}
+        className={`fixed bottom-6 right-6 w-14 h-14 rounded-full flex items-center justify-center shadow-2xl text-3xl transition-all duration-300 z-50 ${
+          copilotOpen
+            ? "bg-gradient-to-r from-pink-500 to-purple-500 scale-110"
+            : "bg-gradient-to-r from-indigo-500 to-blue-600 hover:scale-105"
+        } text-white`}
+      >
+        {copilotOpen ? "💬" : "🤖"}
+      </button>
+
+      {copilotOpen && (
+        <div className="backdrop-blur-xl bg-white/80 dark:bg-gray-900/80 border border-white/10 shadow-2xl rounded-2xl w-[min(480px,90vw)] max-h-[75vh] flex flex-col overflow-hidden animate-fade-in transition-all fixed bottom-24 right-6 z-50">
+          <div className="flex justify-between items-center px-4 py-3 bg-gradient-to-r from-indigo-500 to-blue-600 text-white">
+            <div className="flex items-center gap-2 font-semibold">
+              <span className="text-xl">⚡</span>
+              <span>{t("copilot.title")}</span>
             </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {copilotMessages.map((m, idx) => (
-                <div
-                  key={idx}
-                  className={`p-2 rounded text-sm max-w-[80%] ${
-                    m.role === "user"
-                      ? "bg-blue-100 dark:bg-blue-900 ml-auto"
-                      : "bg-gray-100 dark:bg-gray-700 mr-auto"
-                  }`}
-                >
-                  {m.text}
-                </div>
-              ))}
-              {isThinking && (
-                <div className="text-xs text-gray-400 animate-pulse">
-                  Copilot is thinking...
-                </div>
-              )}
-            </div>
-            <div className="p-2 flex gap-2 border-t dark:border-gray-700">
-              <input
-                type="text"
-                value={copilotInput}
-                onChange={(e) => setCopilotInput(e.target.value)}
-                placeholder="Ask in English / हिंदी / मराठी..."
-                className="flex-1 p-2 rounded border dark:bg-gray-800"
-              />
+            <div className="flex items-center gap-2">
               <button
-                onClick={handleCopilotSend}
-                className="px-2 bg-emerald-600 text-white rounded"
+                onClick={() => setAudioEnabled((s) => !s)}
+                title={audioEnabled ? t("copilot.audio_on") : t("copilot.audio_off")}
+                className={`text-lg transition ${audioEnabled ? "opacity-100" : "opacity-50"}`}
               >
-                ➤
+                🔊
               </button>
+              <button
+                onClick={toggleVoice}
+                className={`text-lg transition ${isListening ? "text-red-400" : "opacity-80"}`}
+              >
+                🎤
+              </button>
+              <button onClick={() => setCopilotOpen(false)} className="hover:rotate-90 transition text-lg">✖</button>
             </div>
           </div>
-        )}
 
-        <button
-          onClick={() => setCopilotOpen(!copilotOpen)}
-          className="relative w-14 h-14 bg-gradient-to-r from-indigo-500 to-blue-500 rounded-full shadow-lg flex items-center justify-center text-white text-2xl animate-glow"
-        >
-          🤖
-          <span className="absolute inset-0 rounded-full bg-gradient-to-r from-indigo-400 to-blue-400 blur opacity-75 animate-pulse" />
-        </button>
-      </div>
+          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 scrollbar-thin scrollbar-thumb-gray-400/40">
+            {copilotMessages.map((m, idx) => (
+              <div
+                key={idx}
+                className={`flex items-start gap-2 animate-fade-in ${
+                  m.role === "user" ? "justify-end" : "justify-start"
+                }`}
+              >
+                {m.role === "bot" && <span className="text-2xl">🤖</span>}
+                <div
+                  className={`p-3 rounded-2xl shadow-sm max-w-[75%] leading-relaxed text-sm ${
+                    m.role === "user"
+                      ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-br-none"
+                      : "bg-gray-100 dark:bg-gray-800 dark:text-gray-100 rounded-bl-none"
+                  }`}
+                >
+                  {m.role === "bot" ? (
+                    <ReactMarkdown>{m.text}</ReactMarkdown>
+                  ) : (
+                    m.text
+                  )}
+                </div>
+                {m.role === "user" && <span className="text-xl">🧍</span>}
+              </div>
+            ))}
+            {isThinking && (
+              <div className="text-xs text-gray-400 italic animate-pulse">
+                {t("copilot.thinking")}
+              </div>
+            )}
+            {isListening && (
+              <div className="text-xs text-red-500 animate-pulse">🎙️ {t("voice.listening")}</div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+
+          <div className="flex items-center gap-2 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-white/70 dark:bg-gray-900/70 backdrop-blur-md">
+            <textarea
+              rows={1}
+              value={copilotInput}
+              onChange={(e) => setCopilotInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void handleCopilotSend();
+                } else if (e.key === "Enter" && e.shiftKey) {
+                  setCopilotInput((p) => p + "\n");
+                }
+              }}
+              placeholder={t("copilot.placeholder")}
+              className="flex-1 p-2 rounded-xl border dark:bg-gray-800 resize-none text-sm focus:ring-2 focus:ring-blue-500 transition"
+            />
+            <button
+              onClick={() => void handleCopilotSend()}
+              className="bg-blue-600 hover:bg-blue-700 text-white rounded-xl p-2 transition"
+            >
+              ➤
+            </button>
+            <button
+              onClick={toggleVoice}
+              className={`rounded-xl p-2 transition ${isListening ? "bg-red-500 text-white" : "bg-gray-200 dark:bg-gray-700"}`}
+            >
+              🎤
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

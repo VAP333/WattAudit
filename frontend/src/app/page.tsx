@@ -1,34 +1,19 @@
 "use client";
-import "@/i18n/client";  // 👈 This MUST come before useTranslation
+import "@/i18n/client"; // must be first for i18n client
 
-// 👇 Add these global declarations to fix TS errors
+// Global window typing for SpeechRecognition
 declare global {
   interface Window {
     SpeechRecognition: any;
     webkitSpeechRecognition: any;
   }
-
-  interface SpeechRecognition {
-    lang: string;
-    interimResults: boolean;
-    maxAlternatives: number;
-    start: () => void;
-    stop: () => void;
-    onstart: () => void;
-    onresult: (event: SpeechRecognitionEvent) => void;
-    onerror: () => void;
-    onend: () => void;
-  }
 }
 
-// TS helper for onresult
-
-
-
-import { useEffect, useState, useRef } from "react";
-import Link from "next/link";
-import { getCustomers, getLive, predict } from "@/lib/api";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import ReactMarkdown from "react-markdown";
 import DarkToggle from "@/components/DarkToggle";
+import { getCustomers, getLive, predict } from "@/lib/api";
 import {
   BarChart,
   Bar,
@@ -39,10 +24,8 @@ import {
   CartesianGrid,
   Label,
 } from "recharts";
-import { useTranslation } from "react-i18next";
 
-// Types
-interface Customer {
+type Customer = {
   customer_id: string;
   consumer_category: string;
   avg_anomaly_score: number;
@@ -51,25 +34,14 @@ interface Customer {
   consumption_kwh: number;
   anomaly_label?: number;
   top_reason?: string;
-}
-
-interface LiveRecord {
-  customer_id: string;
-  month: string;
-  consumption_kwh: number;
-  billed_kwh: number;
-}
-
-// Fix for TS
-type SpeechRecognitionEvent = Event & {
-  results: SpeechRecognitionResultList;
 };
 
-export default function Page() {
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+type LiveRecord = { customer_id: string; month: string; consumption_kwh: number; billed_kwh: number };
+
+export default function Page(): React.ReactElement {
   const { t, i18n } = useTranslation();
 
-  // Dashboard States
+  // Dashboard state
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [filteredCustomers, setFilteredCustomers] = useState<Customer[]>([]);
   const [filter, setFilter] = useState("all");
@@ -80,160 +52,211 @@ export default function Page() {
   const [uploading, setUploading] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
   const [insights, setInsights] = useState<any>(null);
-  const [predictInput, setPredictInput] = useState({
-    consumption: 0,
-    billed: 0,
-    category: "Residential",
-  });
+
+  // Predict
+  const [predictInput, setPredictInput] = useState({ consumption: 0, billed: 0, category: "Residential" });
   const [predictResult, setPredictResult] = useState<any>(null);
 
-  // Copilot States
+  // Copilot state
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [copilotInput, setCopilotInput] = useState("");
-  const [copilotMessages, setCopilotMessages] = useState<
-    { role: "user" | "bot"; text: string }[]
-  >([]);
+  const [copilotMessages, setCopilotMessages] = useState<{ role: "user" | "bot"; text: string }[]>([]);
   const [isThinking, setIsThinking] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const [audioEnabled, setAudioEnabled] = useState<boolean>(false);
-   useEffect(() => {
-    if ("speechSynthesis" in window) {
-      speechSynthesis.onvoiceschanged = () => {
-        speechSynthesis.getVoices();
-      };
-    }
-  }, []);
+  const [audioEnabled, setAudioEnabled] = useState(false);
 
-  // 🎤 Voice Recognition Toggle
-  const toggleVoice = () => {
-    if (isListening) {
-      recognitionRef.current?.stop();
-      setIsListening(false);
-      return;
-    }
-    
+  // Refs for recognition + audio queue
+  const recognitionRef = useRef<any>(null);
+  const audioQueueRef = useRef<HTMLAudioElement[]>([]);
+  const isPlayingRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
+  useEffect(() => {
+    if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [copilotMessages, isThinking]);
 
-    if (!SpeechRecognition) {
-      alert(t("voice.unsupported"));
-      return;
-    }
-    
+  const langMap: Record<string, string> = { en: "en-US", hi: "hi-IN", mr: "mr-IN" };
+  const getLocale = useCallback(() => langMap[i18n.language] || "en-US", [i18n.language]);
 
-
-    const recognition = new SpeechRecognition();
-    recognition.lang = "mr-IN"; // or "hi-IN" or "en-US"
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
-
-    recognition.onstart = () => setIsListening(true);
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      const transcript = event.results[0][0].transcript;
-      setCopilotInput(transcript);
+  // ---- Voice recognition ----
+  const startRecognition = useCallback(() => {
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return alert(t("voice.unsupported"));
+    try {
+      recognitionRef.current?.abort?.();
+    } catch {}
+    const r = new SR();
+    r.lang = getLocale();
+    r.interimResults = false;
+    r.maxAlternatives = 1;
+    r.onstart = () => setIsListening(true);
+    r.onresult = (ev: any) => {
+      try {
+        const transcript = ev.results[0][0].transcript;
+        setCopilotInput(transcript);
+      } catch {}
       setIsListening(false);
     };
-    recognition.onerror = () => setIsListening(false);
-    recognition.onend = () => setIsListening(false);
+    r.onerror = () => setIsListening(false);
+    r.onend = () => setIsListening(false);
+    try {
+      r.start();
+      recognitionRef.current = r;
+    } catch (err) {
+      console.warn("SR start failed", err);
+    }
+  }, [getLocale, t]);
 
-    recognition.start();
-    recognitionRef.current = recognition;
-  };
-  // 🌐 Detect language by checking characters
-const detectLang = (text: string): string => {
-  // Devanagari script used for Marathi / Hindi
-  if (/[ऀ-ॿ]/.test(text)) return "hi-IN"; 
-  // Basic English check
-  if (/[a-zA-Z]/.test(text)) return "en-US"; 
-  // Fallback
-  return "en-US";
-};
+  const stopRecognition = useCallback(() => {
+    try {
+      recognitionRef.current?.stop?.();
+    } catch {}
+    setIsListening(false);
+  }, []);
 
-// 🗣️ Speak response aloud using browser TTS
-const speakText = (text: string, lang: string) => {
-  if (!("speechSynthesis" in window)) {
-    console.warn("❌ Speech Synthesis not supported in this browser.");
-    return;
-  }
+  const toggleVoice = useCallback(() => {
+    if (isListening) stopRecognition();
+    else startRecognition();
+  }, [isListening, startRecognition, stopRecognition]);
 
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = lang;
-  utterance.rate = 1;
-  utterance.pitch = 1;
+  // ---- TTS queue ----
+  const cleanText = (s: string) => s.replace(/[*_#`~>]/g, "").replace(/\s{2,}/g, " ").replace(/\[(.*?)\]\(.*?\)/g, "$1").trim();
 
-  // Try to pick a voice that matches
-  const voices = speechSynthesis.getVoices();
-  const matchedVoice = voices.find((v) => v.lang === lang);
-  if (matchedVoice) utterance.voice = matchedVoice;
+  const enqueueAudio = async (blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    const a = new Audio(url);
+    audioQueueRef.current.push(a);
 
-  speechSynthesis.speak(utterance);
-};
-
-  
-
-  // 🤖 Copilot Send
- const handleCopilotSend = async () => {
-  if (!copilotInput.trim()) return;
-  const query = copilotInput;
-  setCopilotMessages((msgs) => [...msgs, { role: "user", text: query }]);
-  setCopilotInput("");
-  setIsThinking(true);
-
-  const newMsgIndex = copilotMessages.length;
-  setCopilotMessages((msgs) => [...msgs, { role: "bot", text: "" }]);
-
-  try {
-    const res = await fetch("/api/copilot", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query }),
-    });
-
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      setCopilotMessages((msgs) => {
-        const updated = [...msgs];
-        updated[newMsgIndex] = { role: "bot", text: buffer };
-        return updated;
+    const playNext = () => {
+      if (isPlayingRef.current) return;
+      const next = audioQueueRef.current.shift();
+      if (!next) return;
+      isPlayingRef.current = true;
+      audioRef.current = next;
+      next.onended = () => {
+        try {
+          URL.revokeObjectURL(next.src);
+        } catch {}
+        isPlayingRef.current = false;
+        audioRef.current = null;
+        playNext();
+      };
+      void next.play().catch((err) => {
+        console.warn("audio play failed", err);
+        isPlayingRef.current = false;
+        audioRef.current = null;
+        playNext();
       });
+    };
+
+    playNext();
+  };
+
+  const clearAudioQueue = () => {
+    try {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        try {
+          URL.revokeObjectURL(audioRef.current.src);
+        } catch {}
+        audioRef.current = null;
+      }
+    } catch {}
+    while (audioQueueRef.current.length) {
+      const a = audioQueueRef.current.shift()!;
+      try {
+        URL.revokeObjectURL(a.src);
+      } catch {}
     }
-    const lang = detectLang(buffer);
-    if (audioEnabled) {
-      speakText(buffer, lang);
+    isPlayingRef.current = false;
+  };
+
+  const speakText = async (text: string) => {
+    if (!audioEnabled) return;
+    try {
+      const cleaned = cleanText(text);
+      const res = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: cleaned, lang: getLocale() }) });
+      if (!res.ok) throw new Error("TTS failed");
+      const blob = await res.blob();
+      await enqueueAudio(blob);
+    } catch (err) {
+      console.error("TTS error", err);
     }
+  };
 
-    setIsThinking(false);
-  } catch (err) {
-    console.error("❌ Copilot stream error:", err);
-    setCopilotMessages((msgs) => [
-      ...msgs,
-      { role: "bot", text: t("copilot.error") },
-    ]);
-  }
+  useEffect(() => {
+    if (!audioEnabled) clearAudioQueue();
+  }, [audioEnabled]);
 
-  setIsThinking(false);
-};
+  // --- Copilot streaming send ---
+  const handleCopilotSend = useCallback(async () => {
+    if (!copilotInput.trim()) return;
+    const q = copilotInput;
+    setCopilotMessages((m) => [...m, { role: "user", text: q }]);
+    setCopilotInput("");
+    setIsThinking(true);
+    // placeholder bot message that we'll update
+    setCopilotMessages((m) => [...m, { role: "bot", text: "" }]);
 
+    try {
+      const res = await fetch("/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: q }) });
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("no reader");
+      const dec = new TextDecoder();
+      let buffer = "";
+      let sentenceBuffer = "";
 
-  // 📊 Fetch Data
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = dec.decode(value, { stream: true });
+        buffer += chunk;
+        sentenceBuffer += chunk;
+
+        // Update chat text in real-time
+        setCopilotMessages((msgs) => {
+          const copy = [...msgs];
+          const idx = copy.map((x) => x.role).lastIndexOf("bot");
+          if (idx >= 0) copy[idx] = { role: "bot", text: buffer };
+          return copy;
+        });
+
+        // Sentence synchronization
+        const sentences = sentenceBuffer.split(/(?<=[.!?])\s+/);
+        while (sentences.length > 1) {
+          const sentence = sentences.shift()!.trim();
+          if (audioEnabled && sentence.length > 4) {
+            await speakText(sentence); // speak sentence as soon as complete
+          }
+        }
+        sentenceBuffer = sentences.join(" ");
+      }
+
+      // After stream ends, speak leftover sentence
+      if (audioEnabled && sentenceBuffer.trim().length) {
+        await speakText(sentenceBuffer.trim());
+      }
+
+      setIsThinking(false);
+    } catch (err) {
+      console.error(err);
+      setCopilotMessages((m) => [...m, { role: "bot", text: t("copilot.error") }]);
+      setIsThinking(false);
+    }
+  }, [copilotInput, audioEnabled, getLocale, t]);
+
+  // Data fetching
   useEffect(() => {
     let mounted = true;
     (async () => {
       const res = await getCustomers();
-      if (mounted) {
-        setCustomers(res.top_customers || []);
-        setFilteredCustomers(res.top_customers || []);
-        setAlerts(res.total_alerts || 0);
-        setInsights(res.insights || null);
-      }
+      if (!mounted) return;
+      setCustomers(res.top_customers || []);
+      setFilteredCustomers(res.top_customers || []);
+      setAlerts(res.total_alerts || 0);
+      setInsights(res.insights || null);
       setLoading(false);
     })();
     return () => {
@@ -241,7 +264,6 @@ const speakText = (text: string, lang: string) => {
     };
   }, []);
 
-  // 🔄 Live polling
   useEffect(() => {
     let timer: NodeJS.Timeout;
     const fetchLive = async () => {
@@ -253,110 +275,94 @@ const speakText = (text: string, lang: string) => {
     return () => clearInterval(timer);
   }, [autoRefresh]);
 
-  // Filter logic
   useEffect(() => {
     if (filter === "all") setFilteredCustomers(customers);
-    else if (filter === "alerts")
-      setFilteredCustomers(customers.filter((c) => c.anomaly_label === -1));
-    else if (filter === "stable")
-      setFilteredCustomers(customers.filter((c) => c.anomaly_label === 1));
+    else if (filter === "alerts") setFilteredCustomers(customers.filter((c) => c.anomaly_label === -1));
+    else if (filter === "stable") setFilteredCustomers(customers.filter((c) => c.anomaly_label === 1));
   }, [filter, customers]);
 
-  // File Upload
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(true);
     setUploadMessage("");
-    const formData = new FormData();
-    formData.append("file", file);
+    const form = new FormData();
+    form.append("file", file);
     try {
-      const res = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL}/upload_dataset`,
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
-      const data = await res.json();
+      const r = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/upload_dataset`, { method: "POST", body: form });
+      const data = await r.json();
       setUploadMessage(data.message || data.error || t("upload.complete"));
-    } catch {
+    } catch (err) {
       setUploadMessage(t("upload.failed"));
     }
     setUploading(false);
   };
 
-  // Quick Predict
   const handlePredict = async () => {
-    const resp = await predict({
-      consumption_kwh: predictInput.consumption,
-      billed_kwh: predictInput.billed,
-      category: predictInput.category,
-    });
+    const resp = await predict({ consumption_kwh: predictInput.consumption, billed_kwh: predictInput.billed, category: predictInput.category });
     setPredictResult(resp);
   };
 
-  if (loading) return <div className="p-6">{t("loading")}</div>;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setCopilotOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
-  const chartData = customers
-    .slice(0, 12)
-    .map((c) => ({ name: c.customer_id, score: c.avg_anomaly_score }));
+  useEffect(() => {
+    // restart recognition if locale changed while listening
+    if (recognitionRef.current && isListening) {
+      try {
+        recognitionRef.current?.abort?.();
+      } catch {}
+      startRecognition();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [i18n.language]);
+
+  const chartData = customers.slice(0, 12).map((c) => ({ name: c.customer_id, score: c.avg_anomaly_score }));
 
   return (
     <div className="min-h-screen p-6 space-y-6">
-      {/* Header */}
       <header className="flex justify-between items-center">
         <h1 className="text-2xl font-bold flex gap-2 items-center">
-          ⚡ {t("app.title")} {" "}
-          <span className="text-blue-500">{t("app.subtitle")}</span>
+          ⚡ {t("app.title")} <span className="text-blue-500">{t("app.subtitle")}</span>
         </h1>
         <div className="flex gap-3 items-center">
-          <button
-            onClick={() => location.reload()}
-            className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 transition"
-          >
+          <button onClick={() => location.reload()} className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 transition">
             {t("button.refresh")}
           </button>
           <DarkToggle />
         </div>
       </header>
 
-      {/* Status */}
-      <div className="bg-emerald-50 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-100 p-3 rounded shadow text-sm">
-        📡 {t("status.live_mode")}
-      </div>
+      <div className="bg-emerald-50 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-100 p-3 rounded shadow text-sm">📡 {t("status.live_mode")}</div>
 
-      {/* Insights */}
       {insights && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
             <div className="text-sm text-gray-500">{t("insights.top_reason")}</div>
-              <div className="text-xl font-semibold">{insights.top_reason}</div>
+            <div className="text-xl font-semibold">{insights.top_reason}</div>
           </div>
           <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-              <div className="text-sm text-gray-500">{t("insights.riskiest_category")}</div>
-              <div className="text-xl font-semibold">{insights.riskiest_category}</div>
+            <div className="text-sm text-gray-500">{t("insights.riskiest_category")}</div>
+            <div className="text-xl font-semibold">{insights.riskiest_category}</div>
           </div>
           <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-              <div className="text-sm text-gray-500">{t("insights.alerts_vs_last_week")}</div>
-              <div className="text-xl font-semibold">{insights.alert_change}%</div>
+            <div className="text-sm text-gray-500">{t("insights.alerts_vs_last_week")}</div>
+            <div className="text-xl font-semibold">{insights.alert_change}%</div>
           </div>
         </div>
       )}
 
-      {/* Upload */}
       <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
-  <h3 className="font-semibold mb-2">{t("upload.heading")}</h3>
-        <input
-          type="file"
-          accept=".csv"
-          onChange={handleUpload}
-          disabled={uploading}
-        />
+        <h3 className="font-semibold mb-2">{t("upload.heading")}</h3>
+        <input type="file" accept=".csv" onChange={handleUpload} disabled={uploading} />
         {uploadMessage && <p className="text-sm mt-1">{uploadMessage}</p>}
       </div>
 
-      {/* Metrics */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
           <div className="text-sm text-gray-500">{t("metrics.total_customers")}</div>
@@ -372,7 +378,6 @@ const speakText = (text: string, lang: string) => {
         </div>
       </div>
 
-      {/* Chart */}
       <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
         <h3 className="font-semibold mb-3">{t("chart.title")}</h3>
         <div style={{ height: 260 }}>
@@ -392,196 +397,126 @@ const speakText = (text: string, lang: string) => {
         </div>
       </div>
 
-      {/* Table */}
-      <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
-        <div className="flex justify-between items-center mb-3">
-          <h4 className="font-semibold">{t("table.title")}</h4>
-          <div className="flex gap-2 text-sm">
-            {["all", "alerts", "stable"].map((f) => (
-              <button
-                key={f}
-                onClick={() => setFilter(f)}
-                className={`px-3 py-1 rounded ${
-                  filter === f
-                    ? "bg-blue-600 text-white"
-                    : "bg-gray-200 dark:bg-gray-700"
-                }`}
-              >
-                {t(`filters.${f}`)}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead className="bg-gray-100 dark:bg-gray-700">
-              <tr>
-                <th className="p-2 text-left">{t("table.customer")}</th>
-                <th className="p-2">{t("table.category")}</th>
-                <th className="p-2">{t("table.score")}</th>
-                <th className="p-2">{t("table.status")}</th>
-                <th className="p-2">{t("table.badge")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredCustomers.slice(0, 50).map((c, i) => {
-                const anomalous =
-                  c.anomaly_label === -1 || c.avg_anomaly_score < -0.05;
-                const badge = c.top_reason || (anomalous ? t("badge.anomaly") : t("badge.normal"));
-                return (
-                  <tr
-                    key={i}
-                    className="border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-900"
-                  >
-                    <td className="p-2 text-blue-600 dark:text-blue-400 hover:underline">
-                      <Link href={`/customer/${c.customer_id}`}>
-                        {c.customer_id}
-                      </Link>
-                    </td>
-                    <td className="p-2">{c.consumer_category}</td>
-                    <td className="p-2">{c.avg_anomaly_score.toFixed(4)}</td>
-                    <td
-                      className={`p-2 ${
-                        anomalous ? "text-red-600" : "text-green-600"
-                      }`}
-                    >
-                      {anomalous ? t("status.anomalous") : t("status.normal")}
-                    </td>
-                    <td className="p-2">{badge}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Predict Widget */}
-      <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
-        <h4 className="font-semibold mb-2">{t("predict.title")}</h4>
-        <div className="flex flex-col md:flex-row gap-3 mb-3">
-          <input
-            type="number"
-            placeholder={t("predict.placeholder_consumption")}
-            value={predictInput.consumption}
-            onChange={(e) =>
-              setPredictInput({
-                ...predictInput,
-                consumption: Number(e.target.value),
-              })
-            }
-            className="border p-2 rounded flex-1"
-          />
-          <input
-            type="number"
-            placeholder={t("predict.placeholder_billed")}
-            value={predictInput.billed}
-            onChange={(e) =>
-              setPredictInput({
-                ...predictInput,
-                billed: Number(e.target.value),
-              })
-            }
-            className="border p-2 rounded flex-1"
-          />
-          <button
-            onClick={handlePredict}
-            className="px-3 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700"
-          >
-            {t("predict.button")}
-          </button>
-        </div>
-        {predictResult && (
-          <pre className="bg-gray-100 dark:bg-gray-900 p-2 rounded text-xs overflow-auto">
-            {JSON.stringify(predictResult, null, 2)}
-          </pre>
-        )}
-      </div>
-
-      {/* Floating Copilot Arc */}
-      <div className="fixed bottom-6 right-6 flex flex-col items-end space-y-2 z-50">
-        {copilotOpen && (
-          <div className="bg-white dark:bg-gray-800 shadow-lg rounded-lg w-[min(500px,90vw)] max-h-[75vh] flex flex-col overflow-hidden animate-fade-in">
-            <div className="bg-gradient-to-r from-indigo-500 to-blue-500 text-white p-3 font-semibold flex justify-between items-center">
-              <div className="flex items-center gap-3">
-                <span>⚡ {t("copilot.title")}</span>
-              </div>
-              <div className="flex items-center gap-2">
+        {/* Customer Table */}
+        <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
+          <div className="flex justify-between items-center mb-3">
+            <h4 className="font-semibold">{t("table.title")}</h4>
+            <div className="flex gap-2 text-sm">
+              {["all", "alerts", "stable"].map((f) => (
                 <button
-                  onClick={() => setAudioEnabled((s) => !s)}
-                  aria-pressed={audioEnabled}
-                  title={audioEnabled ? t("copilot.audio_on") : t("copilot.audio_off")}
-                  className={`px-2 py-1 rounded-full text-sm transition focus:outline-none focus:ring-2 focus:ring-white/50 ${
-                    audioEnabled ? "bg-white/20 ring-2 ring-white" : "bg-white/10"
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  className={`px-3 py-1 rounded transition ${
+                    filter === f
+                      ? "bg-blue-600 text-white"
+                      : "bg-gray-200 dark:bg-gray-700"
                   }`}
                 >
-                  🔊
+                  {t(`filters.${f}`)}
                 </button>
-                <button
-                  onClick={() => setCopilotOpen(false)}
-                  className="text-white"
-                >
-                  ✖
-                </button>
-              </div>
-            </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {copilotMessages.map((m, idx) => (
-                <div
-                  key={idx}
-                  className={`p-2 rounded text-sm max-w-[80%] ${
-                    m.role === "user"
-                      ? "bg-blue-100 dark:bg-blue-900 ml-auto"
-                      : "bg-gray-100 dark:bg-gray-700 mr-auto"
-                  }`}
-                >
-                  {m.text}
-                </div>
               ))}
-              {isThinking && (
-                <div className="text-xs text-gray-400 animate-pulse">
-                  {t("copilot.thinking")}
-                </div>
-              )}
-            </div>
-            <div className="p-2 flex gap-2 border-t dark:border-gray-700">
-              <input
-                type="text"
-                value={copilotInput}
-                onChange={(e) => setCopilotInput(e.target.value)}
-                placeholder={t("copilot.placeholder", { lng: i18n.language })}
-                className="flex-1 p-2 rounded border dark:bg-gray-800"
-              />
-              <button
-                onClick={handleCopilotSend}
-                className="px-2 bg-emerald-600 text-white rounded"
-              >
-                ➤
-              </button>
-              <button
-                disabled={isListening}
-                onClick={toggleVoice}
-                className={`px-2 rounded ${
-                  isListening
-                    ? "bg-red-500 text-white"
-                    : "bg-gray-200 dark:bg-gray-700"
-                }`}
-              >
-                🎤
-              </button>
             </div>
           </div>
-        )}
 
-        {/* Arc Button */}
-        <button
-          onClick={() => setCopilotOpen(!copilotOpen)}
-          className="relative w-14 h-14 bg-gradient-to-r from-indigo-500 to-blue-500 rounded-full shadow-lg flex items-center justify-center text-white text-2xl animate-glow"
-        >
-          🤖
-          <span className="absolute inset-0 rounded-full bg-gradient-to-r from-indigo-400 to-blue-400 blur opacity-75 animate-pulse" />
-        </button>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead className="bg-gray-100 dark:bg-gray-700">
+                <tr>
+                  <th className="p-2 text-left">{t("table.customer")}</th>
+                  <th className="p-2">{t("table.category")}</th>
+                  <th className="p-2">{t("table.score")}</th>
+                  <th className="p-2">{t("table.status")}</th>
+                  <th className="p-2">{t("table.badge")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredCustomers.slice(0, 50).map((c, i) => {
+                  const anomalous =
+                    c.anomaly_label === -1 || c.avg_anomaly_score < -0.05;
+                  const badge =
+                    c.top_reason || (anomalous ? t("badge.anomaly") : t("badge.normal"));
+                  return (
+                    <tr
+                      key={i}
+                      className="border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-900"
+                    >
+                      <td className="p-2 text-blue-600 dark:text-blue-400 hover:underline">
+                        <a href={`/customer/${c.customer_id}`} target="_blank">
+                          {c.customer_id}
+                        </a>
+                      </td>
+                      <td className="p-2">{c.consumer_category}</td>
+                      <td className="p-2">{c.avg_anomaly_score.toFixed(4)}</td>
+                      <td
+                        className={`p-2 ${
+                          anomalous ? "text-red-600" : "text-green-600"
+                        }`}
+                      >
+                        {anomalous ? t("status.anomalous") : t("status.normal")}
+                      </td>
+                      <td className="p-2">{badge}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="bg-white dark:bg-gray-800 rounded p-4 shadow space-y-3">
+          <h4 className="font-semibold">{t("predict.title")}</h4>
+        <div className="flex flex-col md:flex-row gap-2">
+          <input type="number" placeholder={t("predict.consumption")} value={predictInput.consumption} onChange={(e) => setPredictInput({ ...predictInput, consumption: Number(e.target.value) })} className="border rounded p-2 w-full md:w-auto" />
+          <input type="number" placeholder={t("predict.billed")} value={predictInput.billed} onChange={(e) => setPredictInput({ ...predictInput, billed: Number(e.target.value) })} className="border rounded p-2 w-full md:w-auto" />
+          <select value={predictInput.category} onChange={(e) => setPredictInput({ ...predictInput, category: e.target.value })} className="border rounded p-2">
+            <option>Residential</option>
+            <option>Commercial</option>
+            <option>Industrial</option>
+          </select>
+          <button onClick={handlePredict} className="px-3 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700">{t("predict.button")}</button>
+        </div>
+        {predictResult && <pre className="bg-gray-100 dark:bg-gray-900 p-2 rounded text-xs overflow-auto">{JSON.stringify(predictResult, null, 2)}</pre>}
       </div>
+
+      <button onClick={() => setCopilotOpen((s) => !s)} className={`fixed bottom-6 right-6 w-14 h-14 rounded-full flex items-center justify-center shadow-2xl text-3xl transition-all duration-300 z-50 ${copilotOpen ? "bg-gradient-to-r from-pink-500 to-purple-500 scale-110" : "bg-gradient-to-r from-indigo-500 to-blue-600 hover:scale-105"} text-white`}>
+        {copilotOpen ? "💬" : "🤖"}
+      </button>
+
+      {copilotOpen && (
+        <div className="backdrop-blur-xl bg-white/80 dark:bg-gray-900/80 border border-white/10 shadow-2xl rounded-2xl w-[min(480px,90vw)] max-h-[75vh] flex flex-col overflow-hidden animate-fade-in transition-all fixed bottom-24 right-6 z-50">
+          <div className="flex justify-between items-center px-4 py-3 bg-gradient-to-r from-indigo-500 to-blue-600 text-white">
+            <div className="flex items-center gap-2 font-semibold">
+              <span className="text-xl">⚡</span>
+              <span>{t("copilot.title")}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setAudioEnabled((s) => !s)} title={audioEnabled ? t("copilot.audio_on") : t("copilot.audio_off")} className={`text-lg transition ${audioEnabled ? "opacity-100" : "opacity-50"}`}>🔊</button>
+              <button onClick={() => setCopilotOpen(false)} className="hover:rotate-90 transition text-lg">✖</button>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 scrollbar-thin scrollbar-thumb-gray-400/40">
+            {copilotMessages.map((m, idx) => (
+              <div key={idx} className={`flex items-start gap-2 animate-fade-in ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                {m.role === "bot" && <span className="text-2xl">🤖</span>}
+                <div className={`p-3 rounded-2xl shadow-sm max-w-[75%] leading-relaxed text-sm ${m.role === "user" ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-br-none" : "bg-gray-100 dark:bg-gray-800 dark:text-gray-100 rounded-bl-none"}`}>
+                  {m.role === "bot" ? <ReactMarkdown>{m.text}</ReactMarkdown> : m.text}
+                </div>
+                {m.role === "user" && <span className="text-xl">🧍</span>}
+              </div>
+            ))}
+            {isThinking && <div className="text-xs text-gray-400 italic animate-pulse">{t("copilot.thinking")}</div>}
+            {isListening && <div className="text-xs text-red-500 animate-pulse">🎙️ {t("voice.listening")}</div>}
+            <div ref={messagesEndRef} />
+          </div>
+
+          <div className="flex items-center gap-2 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-white/70 dark:bg-gray-900/70 backdrop-blur-md">
+            <textarea rows={1} value={copilotInput} onChange={(e) => setCopilotInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void handleCopilotSend(); } else if (e.key === "Enter" && e.shiftKey) { setCopilotInput((p) => p + "\n"); } }} placeholder={t("copilot.placeholder")} className="flex-1 p-2 rounded-xl border dark:bg-gray-800 resize-none text-sm focus:ring-2 focus:ring-blue-500 transition" />
+            <button onClick={() => void handleCopilotSend()} className="bg-blue-600 hover:bg-blue-700 text-white rounded-xl p-2 transition">➤</button>
+            <button onClick={toggleVoice} className={`rounded-xl p-2 transition ${isListening ? "bg-red-500 text-white" : "bg-gray-200 dark:bg-gray-700"}`}>🎤</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
