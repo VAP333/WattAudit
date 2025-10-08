@@ -12,7 +12,7 @@ export async function getCustomer(id: string) {
 }
 
 export async function getLive(limit = 100) {
-  const res = await fetch(`${API}/get_data?limit=${limit}`);
+  const res = await fetch(`${API}/customers?limit=${limit}`);
   return res.ok ? res.json() : { error: await res.text() };
 }
 
