@@ -9,7 +9,7 @@ import os
 import psycopg2
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
-from api import customers, anomalies, predict, insights
+from backend.api import customers, anomalies, predict, insights
 
 # ---------- CONFIG & PATHS ----------
 load_dotenv()
