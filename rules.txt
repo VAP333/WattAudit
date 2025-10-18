@@ -3,3 +3,5 @@
 Notebooks: use os.path.abspath("..") or hardcode relative paths.
 
 Scripts: use os.path.dirname(os.path.abspath(__file__)).
+
+fasedip273@djkux.com

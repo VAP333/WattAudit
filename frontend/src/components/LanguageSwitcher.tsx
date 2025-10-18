@@ -2,7 +2,7 @@
 
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import i18n from "@/i18n/client"; // ✅ ensures initialized React-i18next instance
+import i18n from "@/i18n/client";
 
 const LANGS = [
   { code: "en", label: "🇬🇧 English" },
@@ -14,27 +14,27 @@ export default function LanguageSwitcher() {
   const { i18n: i18nextInstance } = useTranslation();
 
   const handleChange = (lng: string) => {
-    i18n.changeLanguage(lng); // ✅ call the imported initialized instance
+    i18n.changeLanguage(lng);
     localStorage.setItem("i18nextLng", lng);
   };
 
   useEffect(() => {
-    const savedLang = localStorage.getItem("i18nextLng");
-    if (savedLang && i18nextInstance.language !== savedLang) {
-      i18n.changeLanguage(savedLang);
+    const saved = localStorage.getItem("i18nextLng");
+    if (saved && i18nextInstance.language !== saved) {
+      i18n.changeLanguage(saved);
     }
   }, [i18nextInstance]);
 
   return (
-    <div className="flex items-center gap-2" suppressHydrationWarning>
+    <div className="flex items-center gap-2">
       {LANGS.map((lang) => (
         <button
           key={lang.code}
           onClick={() => handleChange(lang.code)}
-          className={`px-2 py-1 rounded text-sm transition ${
+          className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all shadow-sm ${
             i18n.language?.startsWith(lang.code)
-              ? "bg-blue-600 text-white font-semibold"
-              : "bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200"
+              ? "bg-blue-600 text-white"
+              : "bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 hover:bg-blue-500 hover:text-white"
           }`}
         >
           {lang.label}

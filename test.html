@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HUSN – Ethereal Elegance</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@3.3.2/dist/tailwind.min.css" rel="stylesheet">
+  <style>
+    body {
+      background: linear-gradient(to bottom right, #fff5f8, #ffeef4);
+    }
+
+    .product-card {
+      transition: transform 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    .product-card:hover {
+      transform: translateY(-8px);
+      box-shadow: 0 12px 25px rgba(0, 0, 0, 0.1);
+    }
+
+    .product-image img {
+      transition: transform 0.4s ease;
+    }
+
+    .product-card:hover .product-image img {
+      transform: scale(1.05);
+    }
+
+    .btn-primary {
+      background: linear-gradient(to right, #ec4899, #db2777);
+    }
+
+    .btn-primary:hover {
+      background: linear-gradient(to right, #db2777, #be185d);
+    }
+  </style>
+</head>
+<body class="font-sans text-gray-800">
+
+  <!-- Header -->
+  <header class="text-center py-10">
+    <h1 class="text-5xl font-extrabold text-pink-600 tracking-tight">HUSN</h1>
+    <p class="mt-3 text-lg text-gray-600">Ethereal Elegance for the Modern Muse</p>
+  </header>
+
+  <!-- Product Grid -->
+  <section class="max-w-6xl mx-auto px-6 pb-20 grid gap-10 md:grid-cols-2 lg:grid-cols-3">
+
+    <!-- Product 1 -->
+    <div class="product-card bg-white rounded-2xl overflow-hidden shadow-lg">
+      <div class="product-image aspect-[3/4] relative">
+        <img src="https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800&q=80" alt="Floral Maxi Dress" class="w-full h-full object-cover">
+        <div class="absolute top-4 right-4 bg-gradient-to-r from-pink-500 to-pink-600 text-white text-xs px-3 py-1.5 rounded-full shadow-lg font-medium">
+          20% OFF
+        </div>
+      </div>
+      <div class="p-5 text-center">
+        <h3 class="font-semibold text-lg">Floral Maxi Dress</h3>
+        <p class="text-sm text-gray-500 mb-3">Soft pastels, timeless flow</p>
+        <button class="btn-primary text-white px-5 py-2 rounded-full text-sm shadow-md transition-all">Shop Now</button>
+      </div>
+    </div>
+
+    <!-- Product 2 -->
+    <div class="product-card bg-white rounded-2xl overflow-hidden shadow-lg">
+      <div class="product-image aspect-[3/4] relative">
+        <img src="https://images.unsplash.com/photo-1618354691323-d3e3a0b9b47b?w=800&q=80" alt="Ethnic Kurta Set" class="w-full h-full object-cover">
+      </div>
+      <div class="p-5 text-center">
+        <h3 class="font-semibold text-lg">Ethnic Kurta Set</h3>
+        <p class="text-sm text-gray-500 mb-3">Elegant silhouettes in soft linen</p>
+        <button class="btn-primary text-white px-5 py-2 rounded-full text-sm shadow-md transition-all">Shop Now</button>
+      </div>
+    </div>
+
+    <!-- Product 3 -->
+    <div class="product-card bg-white rounded-2xl overflow-hidden shadow-lg">
+      <div class="product-image aspect-[3/4] relative">
+        <img src="https://images.unsplash.com/photo-1520975922203-bd5ef14fba6d?w=800&q=80" alt="Crop Top & Skirt Set" class="w-full h-full object-cover">
+      </div>
+      <div class="p-5 text-center">
+        <h3 class="font-semibold text-lg">Crop Top & Skirt Set</h3>
+        <p class="text-sm text-gray-500 mb-3">Playful charm meets bold design</p>
+        <button class="btn-primary text-white px-5 py-2 rounded-full text-sm shadow-md transition-all">Shop Now</button>
+      </div>
+    </div>
+
+    <!-- Product 4 -->
+    <div class="product-card bg-white rounded-2xl overflow-hidden shadow-lg">
+      <div class="product-image aspect-[3/4] relative">
+        <img src="https://images.unsplash.com/photo-1541099649105-f69ad21f3246?w=800&q=80" alt="Bohemian Wrap Dress" class="w-full h-full object-cover">
+      </div>
+      <div class="p-5 text-center">
+        <h3 class="font-semibold text-lg">Bohemian Wrap Dress</h3>
+        <p class="text-sm text-gray-500 mb-3">Breezy, floral, and feminine</p>
+        <button class="btn-primary text-white px-5 py-2 rounded-full text-sm shadow-md transition-all">Shop Now</button>
+      </div>
+    </div>
+
+    <!-- Product 5 -->
+    <div class="product-card bg-white rounded-2xl overflow-hidden shadow-lg">
+      <div class="product-image aspect-[3/4] relative">
+        <img src="https://images.unsplash.com/photo-1512436991641-6745cdb1723f?w=800&q=80" alt="Casual Cotton Suit" class="w-full h-full object-cover">
+      </div>
+      <div class="p-5 text-center">
+        <h3 class="font-semibold text-lg">Casual Cotton Suit</h3>
+        <p class="text-sm text-gray-500 mb-3">Effortless grace for daily wear</p>
+        <button class="btn-primary text-white px-5 py-2 rounded-full text-sm shadow-md transition-all">Shop Now</button>
+      </div>
+    </div>
+
+    <!-- Product 6 -->
+    <div class="product-card bg-white rounded-2xl overflow-hidden shadow-lg">
+      <div class="product-image aspect-[3/4] relative">
+        <img src="https://images.unsplash.com/photo-1503342217505-b0a15ec3261c?w=800&q=80" alt="Evening Gown" class="w-full h-full object-cover">
+      </div>
+      <div class="p-5 text-center">
+        <h3 class="font-semibold text-lg">Evening Gown</h3>
+        <p class="text-sm text-gray-500 mb-3">Radiate confidence and allure</p>
+        <button class="btn-primary text-white px-5 py-2 rounded-full text-sm shadow-md transition-all">Shop Now</button>
+      </div>
+    </div>
+
+  </section>
+</body>
+</html>

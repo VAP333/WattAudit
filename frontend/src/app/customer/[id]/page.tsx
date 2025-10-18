@@ -1,11 +1,13 @@
 "use client";
 
 import "@/i18n/client";
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { getCustomer } from "@/lib/api";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import CopilotInner from "@/components/CopilotInner";
 import {
   LineChart,
   Line,
@@ -14,540 +16,347 @@ import {
   Tooltip,
   ResponsiveContainer,
   CartesianGrid,
-  Label,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  Legend,
 } from "recharts";
 
-// language detection now handled by i18next; we'll derive a short code from i18n.language where needed
+const summaryCache: Record<string, Record<string, string>> = {};
 
 interface RecordData {
   month: string;
   consumption_kwh: number;
   billed_kwh: number;
+  anomaly_score?: number;
+  anomaly_label?: number;
 }
 
 interface CustomerResponse {
   customer_id: string;
+  profile?: Record<string, any>;
   records: RecordData[];
-  summary?: {
-    english?: string;
-    hindi?: string;
-    marathi?: string;
-  };
-  ai_analysis?: {
-    confidence_score?: number;
-    confidence_percent?: number;
-  };
+  summary?: { english?: string; hindi?: string; marathi?: string };
   error?: string;
-}
-
-// Global SpeechRecognition
-declare global {
-  interface Window {
-    SpeechRecognition: any;
-    webkitSpeechRecognition: any;
-  }
 }
 
 export default function CustomerDetail() {
   const params = useParams();
   const id = params?.id as string;
-  const reportRef = useRef<HTMLDivElement>(null);
+  const { t, i18n } = useTranslation();
 
   const [cust, setCust] = useState<CustomerResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const { t, i18n } = useTranslation();
+  const [aiSummary, setAiSummary] = useState("");
+  const [loadingAI, setLoadingAI] = useState(true);
 
-  // derive a short language code for places that previously switched on lang
-  const currentLang: "en" | "hi" | "mr" = ((): "en" | "hi" | "mr" => {
-    const l = (i18n.language || "en").toLowerCase();
-    if (l.startsWith("hi")) return "hi";
-    if (l.startsWith("mr")) return "mr";
-    return "en";
-  })();
+  // ✨ Inline styles
+  const InlineStyles = (
+    <style>{`
+      @keyframes vivid-shimmer {
+        0% { background-position: -250% 0; }
+        100% { background-position: 250% 0; }
+      }
+      .shimmer-rect {
+        background: linear-gradient(
+          90deg,
+          rgba(216, 180, 254, 0.25) 0%,
+          rgba(232, 121, 249, 0.35) 50%,
+          rgba(216, 180, 254, 0.25) 100%
+        );
+        background-size: 300% 100%;
+        animation: vivid-shimmer 5s ease-in-out infinite;
+        border-radius: 12px;
+      }
+      .panel-card {
+        border: 1px solid rgba(168, 85, 247, 0.15);
+        box-shadow: 0 0 20px rgba(168, 85, 247, 0.08);
+        background-color: rgba(255, 255, 255, 0.9);
+        border-radius: 12px;
+        transition: all 0.3s ease;
+      }
+      .dark .panel-card {
+        background-color: rgba(12, 8, 22, 0.75);
+        box-shadow: 0 0 14px rgba(168,85,247,0.08);
+      }
+    `}</style>
+  );
 
-  const [copilotOpen, setCopilotOpen] = useState(false);
-  const [copilotMessages, setCopilotMessages] = useState<
-    { role: "user" | "bot"; text: string }[]
-  >([]);
-  const [copilotInput, setCopilotInput] = useState("");
-  const [isThinking, setIsThinking] = useState(false);
-
-  // voice / recognition states
-  const [isListening, setIsListening] = useState(false);
-  const [audioEnabled, setAudioEnabled] = useState(true);
-  const recognitionRef = useRef<any>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
-
-  // --- TTS setup ---
-  const audioQueueRef = useRef<HTMLAudioElement[]>([]);
-  const isPlayingRef = useRef(false);
-
-  const cleanText = (s: string) =>
-    s.replace(/[*_#`~>]/g, "")
-      .replace(/\s{2,}/g, " ")
-      .replace(/\[(.*?)\]\(.*?\)/g, "$1")
-      .trim();
-
-  const clearAudioQueue = () => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      try {
-        URL.revokeObjectURL(audioRef.current.src);
-      } catch {}
-      audioRef.current = null;
-    }
-    while (audioQueueRef.current.length) {
-      const a = audioQueueRef.current.shift()!;
-      try {
-        URL.revokeObjectURL(a.src);
-      } catch {}
-    }
-    isPlayingRef.current = false;
-  };
-
-  const enqueueAudio = async (blob: Blob) => {
-    const url = URL.createObjectURL(blob);
-    const a = new Audio(url);
-    audioQueueRef.current.push(a);
-
-    const playNext = () => {
-      if (isPlayingRef.current) return;
-      const next = audioQueueRef.current.shift();
-      if (!next) return;
-      isPlayingRef.current = true;
-      audioRef.current = next;
-      next.onended = () => {
-        try {
-          URL.revokeObjectURL(next.src);
-        } catch {}
-        isPlayingRef.current = false;
-        audioRef.current = null;
-        playNext();
-      };
-      void next.play().catch(() => {
-        isPlayingRef.current = false;
-        audioRef.current = null;
-        playNext();
-      });
-    };
-
-    playNext();
-  };
-
-  // play TTS directly (after full response) — uses audioRef for pause/cleanup
-  const speakText = async (text: string) => {
-    if (!audioEnabled || !text.trim()) return;
-    try {
-      const cleaned = cleanText(text);
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: cleaned, lang: i18n.language }),
-      });
-      if (!res.ok) throw new Error("TTS failed");
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audioRef.current = audio;
-      await audio.play();
-    } catch (err) {
-      console.warn("TTS error:", err);
-    }
-  };
-
-  const clearAudio = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      try { URL.revokeObjectURL(audioRef.current.src); } catch {}
-      audioRef.current = null;
-    }
-  }, []);
-
-  // language mapping for SpeechRecognition / TTS locale
-  const langMap: Record<string, string> = { en: "en-US", hi: "hi-IN", mr: "mr-IN" };
-  const getLocale = useCallback(() => langMap[i18n.language] || "en-US", [i18n.language]);
-
-  // SpeechRecognition helpers
-  const startRecognition = useCallback(() => {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) return alert(t("voice.unsupported"));
-    try { recognitionRef.current?.abort?.(); } catch {}
-    const r = new SR();
-    r.lang = getLocale();
-    r.interimResults = false;
-    r.maxAlternatives = 1;
-    r.onstart = () => setIsListening(true);
-    r.onresult = (ev: any) => {
-      const transcript = ev.results[0][0].transcript;
-      setCopilotInput(transcript);
-      setIsListening(false);
-    };
-    r.onerror = () => setIsListening(false);
-    r.onend = () => setIsListening(false);
-    try { r.start(); recognitionRef.current = r; } catch (err) {
-      console.warn("SR start failed", err);
-    }
-  }, [getLocale, t]);
-
-  const stopRecognition = useCallback(() => {
-    try { recognitionRef.current?.stop?.(); } catch {}
-    setIsListening(false);
-  }, []);
-
-  const toggleVoice = useCallback(() => {
-    if (isListening) stopRecognition();
-    else startRecognition();
-  }, [isListening, startRecognition, stopRecognition]);
-
+  // 🔹 Fetch customer data
   useEffect(() => {
     if (!id) return;
     (async () => {
-      const r = await getCustomer(id);
-      setCust(r);
-      setLoading(false);
+      setLoading(true);
+      try {
+        const r = await getCustomer(id);
+        setCust(r);
+      } catch (err) {
+        console.error("Failed to fetch customer:", err);
+        setCust({
+          customer_id: id,
+          records: [],
+          error: "Unable to load customer data.",
+        });
+      } finally {
+        setLoading(false);
+      }
     })();
   }, [id]);
 
-  const handleCopilotSend = async () => {
-    if (!copilotInput.trim()) return;
-    const q = copilotInput;
-    setCopilotMessages((m) => [...m, { role: "user", text: q }]);
-    setCopilotInput("");
-    setIsThinking(true);
-    setCopilotMessages((m) => [...m, { role: "bot", text: "" }]);
+  // 🔹 Generate AI summary (fresh + cached per language)
+  useEffect(() => {
+    if (!cust) return;
 
-    try {
-      const res = await fetch("/api/copilot", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: q,
-          lang: i18n.language, // ensure the model replies in the selected language
-          customer_id: id,
-          summary: cust?.summary,
-          recent_data: cust?.records.slice(-6),
-        }),
-      });
+    const lang = i18n.language.startsWith("hi")
+      ? "hindi"
+      : i18n.language.startsWith("mr")
+      ? "marathi"
+      : "english";
 
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error("no reader");
-
-      const dec = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = dec.decode(value, { stream: true });
-        buffer += chunk;
-
-        setCopilotMessages((msgs) => {
-          const copy = [...msgs];
-          const idx = copy.map((x) => x.role).lastIndexOf("bot");
-          if (idx >= 0) copy[idx] = { role: "bot", text: buffer };
-          return copy;
-        });
-      }
-
-      if (audioEnabled && buffer.trim().length) {
-        await speakText(buffer); // speak only after full message
-      }
-
-      setIsThinking(false);
-    } catch (err) {
-      console.error(err);
-      setCopilotMessages((m) => [...m, { role: "bot", text: t("copilot.error") }]);
-      setIsThinking(false);
+    if (summaryCache[cust.customer_id]?.[lang]) {
+      setAiSummary(summaryCache[cust.customer_id][lang]);
+      setLoadingAI(false);
+      return;
     }
-  };
 
-  useEffect(() => {
-    if (!copilotOpen) clearAudio(); // stop any ongoing speech when assistant closes
-    const handleVisibilityChange = () => {
-      if (document.hidden) clearAudio(); // stop when tab is hidden
-    };
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
-  }, [copilotOpen, clearAudio]);
+    (async () => {
+      setLoadingAI(true);
+      try {
+        const res = await fetch("/api/copilot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: `
+Write a detailed, narrative-style report for customer ${cust.customer_id} in ${lang}.
+Summarize monthly consumption and billing trends, anomaly behavior, and seasonal patterns.
+Discuss billing efficiency, highlight any irregularities, and provide likely causes (e.g., under-billing, load variation, meter fault).
+Write like a professional AI auditor explaining insights to an analyst.Bold important points.
+`,
+            lang,
+            context: cust,
+            customer_id: cust.customer_id,   // ✅ added
+        records: cust.records,           // ✅ added for context
+        ai_summary: cust.summary,  
+          }),
+        });
 
-  // scroll to bottom when messages update
-  useEffect(() => {
-    if (messagesEndRef.current)
-      messagesEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [copilotMessages, isThinking]);
+        const text = await res.text();
+        summaryCache[cust.customer_id] = {
+          ...summaryCache[cust.customer_id],
+          [lang]: text,
+        };
+        setAiSummary(text);
+      } catch (err) {
+        console.error("AI summary generation failed:", err);
+        setAiSummary(t("no_summary") || "No summary available.");
+      } finally {
+        setLoadingAI(false);
+      }
+    })();
+  }, [cust, i18n.language]);
+
+  // 🧮 Data processing
+  const parsedRecords = useMemo(() => {
+    return (
+      cust?.records
+        ?.map((r) => {
+          const monthDate = new Date(r.month);
+          return {
+            ...r,
+            monthLabel: monthDate.toLocaleDateString(),
+            consumption: Number(r.consumption_kwh ?? 0),
+            billed: Number(r.billed_kwh ?? 0),
+            ratio:
+              Number(r.consumption_kwh ?? 0) > 0
+                ? Number(r.billed_kwh) / Number(r.consumption_kwh)
+                : 0,
+          };
+        })
+        .sort((a, b) => new Date(a.month).getTime() - new Date(b.month).getTime()) ?? []
+    );
+  }, [cust]);
+
+  const anomalyCounts = useMemo(() => {
+    const anomalous = parsedRecords.filter((r) => r.anomaly_label === -1).length;
+    const normal = parsedRecords.length - anomalous;
+    return [
+      { name: t("status.anomalous") || "Anomalous", value: anomalous },
+      { name: t("status.normal") || "Normal", value: normal },
+    ];
+  }, [parsedRecords, t]);
+
+  const profile = cust?.profile ?? {};
+  const displayName = profile.name || cust?.customer_id;
 
   if (loading) {
     return (
-      <div className="p-6 animate-pulse text-gray-600 dark:text-gray-300">
-        {t("loading_insights")}
+      <div className="min-h-screen flex items-center justify-center">
+        {InlineStyles}
+        <div className="w-80 h-40 shimmer-rect"></div>
       </div>
     );
   }
 
-  if (!cust || cust.error) {
+  if (!cust || cust.error || !parsedRecords.length) {
     return (
-      <div className="p-6 text-red-500">
-        {t("no_data")}: {cust?.error}
+      <div className="min-h-screen flex flex-col items-center justify-center text-center p-6 text-red-600">
+        {InlineStyles}
+        <h2 className="text-xl font-semibold mb-2">{t("no_data") || "No Data"}</h2>
+        <p>{cust?.error || "No records found for this customer."}</p>
+        <a href="/" className="mt-4 text-sm text-purple-600 underline hover:text-purple-800">
+          ← {t("back_dashboard") || "Back to Dashboard"}
+        </a>
       </div>
     );
   }
-
-  const chartData = cust.records.map((r: RecordData) => ({
-    name: new Date(r.month).toLocaleDateString(),
-    consumption: r.consumption_kwh,
-    billed: r.billed_kwh,
-  }));
-
-  const confidenceRaw =
-    cust.ai_analysis?.confidence_score ??
-    cust.ai_analysis?.confidence_percent ??
-    0;
-
-  const confidenceText =
-    confidenceRaw >= 80
-      ? t("confidence.high", { lng: i18n.language })
-      : confidenceRaw >= 60
-      ? t("confidence.medium", { lng: i18n.language })
-      : t("confidence.low", { lng: i18n.language });
-
-  const barColor =
-    confidenceRaw >= 80
-      ? "from-green-400 to-green-600"
-      : confidenceRaw >= 60
-      ? "from-yellow-400 to-yellow-600"
-      : "from-red-400 to-red-600";
 
   return (
-    <div className="p-6 min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-950 transition-colors duration-500">
-      {/* Header */}
-      <div className="flex justify-between items-center mb-6">
-        <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">
-          ⚡ {t("customer_title")} —{" "}
-          <span className="text-blue-600 dark:text-blue-400">
-            {cust.customer_id}
-          </span>
-        </h2>
-      </div>
+    <div className="min-h-screen py-8 px-4 md:px-8 lg:px-12 text-gray-900 dark:text-gray-100">
+      {InlineStyles}
 
-      <div ref={reportRef} className="space-y-6">
-        {/* Summary */}
-        <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6 border-l-4 border-blue-500">
-          <h3 className="font-semibold text-xl mb-3 text-blue-600 dark:text-blue-400">
-            {t("explainable_ai_summary")}
-          </h3>
-          <p className="mb-3 leading-relaxed">
-            <strong>{t("label_english")}:</strong> {cust.summary?.english}
+      {/* 🌟 Summary */}
+      <section className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+        <div className="panel-card p-6 col-span-2">
+          <h2 className="text-2xl font-bold text-purple-700 dark:text-purple-300 mb-2 flex items-center gap-3">
+             {displayName}
+          </h2>
+
+          <p className="text-sm opacity-70 mb-3">
+            {profile.consumer_category} • {profile.district}
           </p>
-          <p className="mb-2 text-gray-700 dark:text-gray-300">
-            <strong>{t("label_hindi")}:</strong> {cust.summary?.hindi}
-          </p>
-          <p className="text-gray-700 dark:text-gray-300">
-            <strong>{t("label_marathi")}:</strong> {cust.summary?.marathi}
-          </p>
+
+          {loadingAI ? (
+            <div className="shimmer-rect h-24 w-full"></div>
+          ) : (
+            <div className="text-sm leading-relaxed">
+              <ReactMarkdown rehypePlugins={[rehypeRaw]}>{aiSummary}</ReactMarkdown>
+            </div>
+          )}
         </div>
 
-        {/* Confidence */}
-        <div className="bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-600 rounded-xl shadow-sm p-6">
-          <h3 className="font-semibold text-blue-700 dark:text-blue-400 mb-3 text-lg">
-            {t("ai_confidence_insights")}
-          </h3>
-          <p className="text-sm sm:text-base mb-2 sm:mb-0">
-            <strong>{t("confidence_score")}:</strong>{" "}
-            <span className="font-medium">{confidenceRaw.toFixed(2)}%</span> —{" "}
-            {confidenceText}
-          </p>
-          <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3 mt-4 overflow-hidden">
-            <div
-              className={`h-3 bg-gradient-to-r ${barColor} rounded-full transition-all duration-700`}
-              style={{ width: `${confidenceRaw}%` }}
-            ></div>
-          </div>
-        </div>
+        <div className="panel-card p-6 text-sm">
+  <h3 className="font-semibold text-gray-700 dark:text-gray-300 mb-2">
+    {t("customer.details_title") || "Customer Details"}
+  </h3>
+  <div className="space-y-1">
+    <div><b>{t("customer.id") || "ID"}:</b> {cust.customer_id}</div>
+    <div><b>{t("customer.name") || "Name"}:</b> {profile.name ?? "—"}</div>
+    <div>
+      <b>{t("customer.category") || "Category"}:</b>{" "}
+      {t(`category_labels.${profile.consumer_category?.toLowerCase()}`) ||
+        profile.consumer_category ||
+        "—"}
+    </div>
+    <div><b>{t("customer.district") || "District"}:</b> {profile.district ?? "—"}</div>
+    <div><b>{t("customer.substation") || "Substation"}:</b> {profile.substation ?? "—"}</div>
+    <div><b>{t("customer.install_year") || "Install Year"}:</b> {profile.install_year ?? "—"}</div>
+    <div><b>{t("customer.meter_make") || "Meter Make"}:</b> {profile.meter_make ?? "—"}</div>
+    {profile.phone && <div>📞 {profile.phone}</div>}
+    {profile.email && <div>✉️ {profile.email}</div>}
+    {profile.address && <div>📍 {profile.address}</div>}
+  </div>
+</div>
 
-        {/* Chart */}
-        <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-lg">
-          <h3 className="font-semibold mb-3 text-lg">
-            {t("chart.title", { lng: i18n.language })}
-          </h3>
+      </section>
+
+      {/* 📈 Charts */}
+      <section className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+        <div className="panel-card p-4 lg:col-span-2">
+          <h4 className="font-semibold text-lg text-purple-600 dark:text-purple-300 mb-2">
+            {t("chart.title") || "Consumption vs Billed (kWh)"}
+          </h4>
           <ResponsiveContainer width="100%" height={320}>
-            <LineChart
-              data={chartData}
-              margin={{ top: 20, right: 30, left: 60, bottom: 40 }}
-            >
-              <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-              <XAxis dataKey="name" tick={{ fontSize: 12 }}>
-                <Label
-                  value={t("label.month", { lng: i18n.language })}
-                  offset={-10}
-                  position="insideBottom"
-                />
-              </XAxis>
-              <YAxis tick={{ fontSize: 12 }}>
-                <Label
-                  value={t("label.kwh")}
-                  angle={-90}
-                  position="insideLeft"
-                  offset={-50}
-                  style={{ textAnchor: "middle" }}
-                />
-              </YAxis>
+            <LineChart data={parsedRecords}>
+              <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+              <XAxis dataKey="monthLabel" tick={{ fontSize: 12 }} />
+              <YAxis tick={{ fontSize: 12 }} />
               <Tooltip />
-              <Line
-                dataKey="consumption"
-                stroke="#10B981"
-                strokeWidth={2.5}
-                dot={false}
-                name={t("chart.consumption", { lng: i18n.language })}
-              />
-              <Line
-                dataKey="billed"
-                stroke="#6366F1"
-                strokeWidth={2.5}
-                dot={false}
-                name={t("chart.billed", { lng: i18n.language })}
-              />
+              <Line dataKey="consumption" stroke="#7c3aed" strokeWidth={2.5} dot={false} />
+              <Line dataKey="billed" stroke="#ec4899" strokeWidth={2.5} dot={false} />
             </LineChart>
           </ResponsiveContainer>
         </div>
 
-        {/* Table */}
-        <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-md">
-          <h3 className="font-semibold mb-3 text-lg">
-            {t("table.detailed_title", { lng: i18n.language })}
-          </h3>
-          <div className="overflow-auto rounded-lg border dark:border-gray-700">
-            <table className="min-w-full text-sm">
-              <thead className="bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
-                <tr>
-                  <th className="p-2 text-left">{t("table.month")}</th>
-                  <th className="p-2 text-left">{t("table.consumption_kwh")}</th>
-                  <th className="p-2 text-left">{t("table.billed_kwh")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {cust.records.map((r: RecordData, i: number) => (
-                  <tr
-                    key={i}
-                    className="border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-900 transition"
-                  >
-                    <td className="p-2">
-                      {new Date(r.month).toLocaleDateString()}
-                    </td>
-                    <td className="p-2">{r.consumption_kwh}</td>
-                    <td className="p-2">{r.billed_kwh.toFixed(2)}</td>
-                  </tr>
+        <div className="panel-card p-4">
+          <h4 className="font-semibold text-lg text-purple-600 dark:text-purple-300 mb-2">
+            {t("top_flagged") || "Anomaly Distribution"}
+          </h4>
+          <ResponsiveContainer width="100%" height={260}>
+            <PieChart>
+              <Pie
+                data={anomalyCounts}
+                dataKey="value"
+                nameKey="name"
+                innerRadius={60}
+                outerRadius={90}
+                paddingAngle={5}
+              >
+                {anomalyCounts.map((_, i) => (
+                  <Cell key={i} fill={i === 0 ? "#ef4444" : "#22c55e"} />
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </Pie>
+              <Tooltip />
+              <Legend />
+            </PieChart>
+          </ResponsiveContainer>
         </div>
-      </div>
+      </section>
 
-      {/* Copilot Floating Assistant */}
-      <button
-        onClick={() => setCopilotOpen((s) => !s)}
-        className={`fixed bottom-6 right-6 w-14 h-14 rounded-full flex items-center justify-center shadow-2xl text-3xl transition-all duration-300 z-50 ${
-          copilotOpen
-            ? "bg-gradient-to-r from-pink-500 to-purple-500 scale-110"
-            : "bg-gradient-to-r from-indigo-500 to-blue-600 hover:scale-105"
-        } text-white`}
-      >
-        {copilotOpen ? "💬" : "🤖"}
-      </button>
-
-      {copilotOpen && (
-        <div className="backdrop-blur-xl bg-white/80 dark:bg-gray-900/80 border border-white/10 shadow-2xl rounded-2xl w-[min(480px,90vw)] max-h-[75vh] flex flex-col overflow-hidden animate-fade-in transition-all fixed bottom-24 right-6 z-50">
-          <div className="flex justify-between items-center px-4 py-3 bg-gradient-to-r from-indigo-500 to-blue-600 text-white">
-            <div className="flex items-center gap-2 font-semibold">
-              <span className="text-xl">⚡</span>
-              <span>{t("copilot.title")}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setAudioEnabled((s) => !s)}
-                title={audioEnabled ? t("copilot.audio_on") : t("copilot.audio_off")}
-                className={`text-lg transition ${audioEnabled ? "opacity-100" : "opacity-50"}`}
-              >
-                🔊
-              </button>
-              <button
-                onClick={toggleVoice}
-                className={`text-lg transition ${isListening ? "text-red-400" : "opacity-80"}`}
-              >
-                🎤
-              </button>
-              <button onClick={() => setCopilotOpen(false)} className="hover:rotate-90 transition text-lg">✖</button>
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 scrollbar-thin scrollbar-thumb-gray-400/40">
-            {copilotMessages.map((m, idx) => (
-              <div
-                key={idx}
-                className={`flex items-start gap-2 animate-fade-in ${
-                  m.role === "user" ? "justify-end" : "justify-start"
-                }`}
-              >
-                {m.role === "bot" && <span className="text-2xl">🤖</span>}
-                <div
-                  className={`p-3 rounded-2xl shadow-sm max-w-[75%] leading-relaxed text-sm ${
-                    m.role === "user"
-                      ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-br-none"
-                      : "bg-gray-100 dark:bg-gray-800 dark:text-gray-100 rounded-bl-none"
-                  }`}
-                >
-                  {m.role === "bot" ? (
-                    <ReactMarkdown>{m.text}</ReactMarkdown>
-                  ) : (
-                    m.text
-                  )}
-                </div>
-                {m.role === "user" && <span className="text-xl">🧍</span>}
-              </div>
-            ))}
-            {isThinking && (
-              <div className="text-xs text-gray-400 italic animate-pulse">
-                {t("copilot.thinking")}
-              </div>
-            )}
-            {isListening && (
-              <div className="text-xs text-red-500 animate-pulse">🎙️ {t("voice.listening")}</div>
-            )}
-            <div ref={messagesEndRef} />
-          </div>
-
-          <div className="flex items-center gap-2 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-white/70 dark:bg-gray-900/70 backdrop-blur-md">
-            <textarea
-              rows={1}
-              value={copilotInput}
-              onChange={(e) => setCopilotInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void handleCopilotSend();
-                } else if (e.key === "Enter" && e.shiftKey) {
-                  setCopilotInput((p) => p + "\n");
-                }
-              }}
-              placeholder={t("copilot.placeholder")}
-              className="flex-1 p-2 rounded-xl border dark:bg-gray-800 resize-none text-sm focus:ring-2 focus:ring-blue-500 transition"
-            />
-            <button
-              onClick={() => void handleCopilotSend()}
-              className="bg-blue-600 hover:bg-blue-700 text-white rounded-xl p-2 transition"
-            >
-              ➤
-            </button>
-            <button
-              onClick={toggleVoice}
-              className={`rounded-xl p-2 transition ${isListening ? "bg-red-500 text-white" : "bg-gray-200 dark:bg-gray-700"}`}
-            >
-              🎤
-            </button>
-          </div>
+      {/* 🧾 Detailed Table */}
+      <section className="panel-card p-6 mb-8">
+        <h3 className="font-semibold mb-3 text-purple-600 dark:text-purple-300 text-lg">
+          {t("table.detailed_title") || "Detailed Monthly Records"}
+        </h3>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead className="bg-white/75 dark:bg-[#1b1630]/60">
+              <tr>
+                <th className="p-3 text-left">{t("table.month")}</th>
+                <th className="p-3 text-left">{t("table.consumption_kwh")}</th>
+                <th className="p-3 text-left">{t("table.billed_kwh")}</th>
+                <th className="p-3 text-left">{t("table.score")}</th>
+                <th className="p-3 text-left">{t("table.status")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {parsedRecords.map((r, i) => (
+                <tr key={i} className="border-b border-white/10">
+                  <td className="p-3">{r.monthLabel}</td>
+                  <td className="p-3">{r.consumption.toFixed(2)}</td>
+                  <td className="p-3">{r.billed.toFixed(2)}</td>
+                  <td className="p-3">{r.anomaly_score?.toFixed(3)}</td>
+                  <td className="p-3">
+                    <span
+                      className={`px-2 py-1 rounded-full text-xs ${
+                        r.anomaly_label === -1
+                          ? "bg-red-100 text-red-700"
+                          : "bg-green-100 text-green-700"
+                      }`}
+                    >
+                      {r.anomaly_label === -1
+                        ? t("status.anomalous")
+                        : t("status.normal")}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      )}
+      </section>
+
+      {/* 🤖 Copilot */}
+      <CopilotInner
+        i18nLanguage={i18n.language}
+        context={{
+          customer_id: cust.customer_id,
+          profile,
+          records: cust.records,
+          ai_summary: aiSummary,
+        }}
+      />
     </div>
   );
 }

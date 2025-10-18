@@ -44,7 +44,20 @@ else:
     }
 
 # --------- Features ---------
-features = ["consumption_kwh", "billed_kwh", "ratio", "monthly_change", "cat_dev", "billing_gap"]
+features = [
+    "consumption_kwh",
+    "billed_kwh",
+    "ratio",
+    "monthly_change",
+    "cat_dev",
+    "billing_gap",
+    "rolling_avg_3m",
+    "rolling_std_3m",
+    "volatility",
+    "billing_efficiency",
+    "season_sin",
+    "season_cos",
+]
 X = df[features].fillna(0)
 scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
 X_scaled = scaler.transform(X)
@@ -54,16 +67,38 @@ X_scaled = scaler.transform(X)
 df["iso_score"] = iso.score_samples(X_scaled)
 
 
+# Local Outlier Factor — continuous scoring for hybrid evaluation
 lof = LocalOutlierFactor(
     n_neighbors=best_params.get("lof_n_neighbors", 20),
     contamination=best_params.get("lof_contamination", 0.05),
+    novelty=True  # ✅ enables scoring on same data
 )
-df["lof_pred"] = lof.fit_predict(X_scaled)
+lof.fit(X_scaled)
+df["lof_score"] = -lof.score_samples(X_scaled)  # higher = more anomalous
+
+# --------- Deep Hybrid Meta-Model Integration ---------
+meta_model_path = os.path.join(MODEL_DIR, "meta_model.pkl")
+if os.path.exists(meta_model_path):
+    meta_model = joblib.load(meta_model_path)
+    meta_features = df[["iso_score", "lof_score", "rule_flag"]] if "rule_flag" in df.columns else df[["iso_score", "lof_score"]]
+    # probability of being synthetic/anomalous (meta model trained with is_synthetic)
+    try:
+        df["meta_pred_prob"] = meta_model.predict_proba(meta_features)[:, 1]
+        df["meta_norm"] = MinMaxScaler().fit_transform(df[["meta_pred_prob"]])
+        print("🤖 Meta-model predictions integrated successfully.")
+    except Exception:
+        df["meta_norm"] = 0
+        print("⚠️ Meta-model loaded but failed to predict — skipping meta integration.")
+else:
+    df["meta_norm"] = 0
+    print("⚠️ Meta-model not found — skipping deep hybrid layer.")
+
 
 # --------- Step 2: Normalize Scores ---------
 scaler = MinMaxScaler()
 df["iso_norm"] = scaler.fit_transform(df[["iso_score"]])
-df["lof_norm"] = scaler.fit_transform(np.abs(df[["lof_pred"]]))  # LOF outputs -1/1 → abs makes it consistent
+df["lof_norm"] = scaler.fit_transform(df[["lof_score"]])
+
 
 alpha = best_params.get("alpha", 0.5)
 df["combined_score"] = alpha * df["iso_norm"] + (1 - alpha) * df["lof_norm"]
@@ -74,7 +109,12 @@ over_flag = (df["ratio"] > 1.3).astype(int)
 df["rule_flag"] = under_flag | over_flag
 
 # Mild penalty for rule-based anomalies
-df["final_score"] = df["combined_score"] - df["rule_flag"] * 0.2
+# Blend combined_score with meta_norm for a deep-hybrid final ranking
+df["final_score"] = (
+    0.7 * df["combined_score"] +
+    0.3 * df["meta_norm"] -
+    df["rule_flag"] * 0.2
+)
 
 # --------- Step 4: True Labels (BEFORE auto-threshold!) ---------
 if "is_synthetic" in df.columns:
@@ -135,6 +175,11 @@ print(f"Precision: {precision:.3f}")
 print(f"Recall:    {recall:.3f}")
 print(f"F1 Score:  {f1:.3f}")
 
+# --- Diagnostic: how much did the meta layer help? ---
+if "meta_norm" in df.columns and df["meta_norm"].sum() > 0:
+    corr = np.corrcoef(df["meta_norm"], df["final_score"])[0, 1]
+    print(f"🧠 Meta–Hybrid correlation: {corr:.3f} (higher = better alignment)")
+
 # --------- Step 7: Confusion Matrix ---------
 cm = confusion_matrix(df["true_label"], df["pred"], labels=[-1, 1])
 plt.figure(figsize=(5, 4))
@@ -166,6 +211,46 @@ results = (
 results.to_csv(RESULTS_FILE, index=False)
 print(f"✅ Detailed evaluation results saved to {RESULTS_FILE}")
 
+# ----------------- Add human-readable reasons for exported results -----------------
+def generate_reason(row):
+    reasons = []
+    # use safe getters in case fields are missing or NaN
+    try:
+        ratio = float(row.get("ratio", 1.0))
+    except Exception:
+        ratio = 1.0
+    try:
+        monthly_change = float(row.get("monthly_change", 0.0))
+    except Exception:
+        monthly_change = 0.0
+
+    if ratio < 0.85:
+        reasons.append("Under-billing suspected")
+    elif ratio > 1.3:
+        reasons.append("Over-billing anomaly")
+    if abs(monthly_change) > 100:
+        reasons.append("Sudden consumption jump/drop")
+    if int(row.get("persistent_anomaly", 0)) == 1:
+        reasons.append("Repeated anomaly pattern")
+    if not reasons:
+        reasons.append("Normal pattern")
+    return " | ".join(reasons)
+
+# Use the customer's latest record to provide context for the reason column
+recent = (
+    df.sort_values(["customer_id", "month"])  # chronological
+    .groupby("customer_id")
+    .last()
+    .reset_index()[["customer_id", "ratio", "monthly_change", "persistent_anomaly"]]
+)
+
+results = results.merge(recent, on="customer_id", how="left")
+results["reason"] = results.apply(generate_reason, axis=1)
+
+# overwrite exported results with the enriched CSV
+results.to_csv(RESULTS_FILE, index=False)
+print(f"✅ Detailed evaluation results (with reasons) saved to {RESULTS_FILE}")
+
 # --------- Step 9: Logging ---------
 new_log = pd.DataFrame([{
     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -174,6 +259,14 @@ new_log = pd.DataFrame([{
     "f1_score": round(f1, 3),
     "notes": "Improved hybrid evaluation (normalized + persistence)"
 }])
+
+# --- Explainability diagnostics appended to the log ---
+new_log["best_threshold"] = round(best_threshold, 3)
+if "meta_norm" in df.columns:
+    corr = np.corrcoef(df["meta_norm"], df["final_score"])[0, 1]
+    new_log["meta_corr"] = round(corr, 3)
+else:
+    new_log["meta_corr"] = None
 
 if os.path.exists(LOG_FILE):
     log = pd.read_csv(LOG_FILE)

@@ -25,13 +25,28 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     # Core ratios
     df["ratio"] = df["billed_kwh"] / (df["consumption_kwh"] + 1)
     df["monthly_change"] = df.groupby("customer_id")["consumption_kwh"].diff().fillna(0)
-
-    # Category-level deviation
     category_avg = df.groupby("consumer_category")["consumption_kwh"].transform("mean")
     df["cat_dev"] = df["consumption_kwh"] - category_avg
-
-    # Billing gap
     df["billing_gap"] = df["consumption_kwh"] - df["billed_kwh"]
+
+    # ⚡ Advanced temporal & behavioral features
+    df["rolling_avg_3m"] = (
+        df.groupby("customer_id")["consumption_kwh"]
+        .rolling(3, min_periods=1)
+        .mean()
+        .reset_index(0, drop=True)
+    )
+    df["rolling_std_3m"] = (
+        df.groupby("customer_id")["consumption_kwh"]
+        .rolling(3, min_periods=1)
+        .std()
+        .reset_index(0, drop=True)
+        .fillna(0)
+    )
+    df["volatility"] = df["rolling_std_3m"] / (df["rolling_avg_3m"] + 1)
+    df["billing_efficiency"] = df["billed_kwh"] / (df["consumption_kwh"] + 1)
+    df["season_sin"] = np.sin(2 * np.pi * df["month"].dt.month / 12)
+    df["season_cos"] = np.cos(2 * np.pi * df["month"].dt.month / 12)
 
     return df
 
@@ -50,6 +65,20 @@ FEATURES = [
     "monthly_change",
     "cat_dev",
     "billing_gap",
+]
+FEATURES = [
+    "consumption_kwh",
+    "billed_kwh",
+    "ratio",
+    "monthly_change",
+    "cat_dev",
+    "billing_gap",
+    "rolling_avg_3m",
+    "rolling_std_3m",
+    "volatility",
+    "billing_efficiency",
+    "season_sin",
+    "season_cos",
 ]
 X = df[FEATURES].fillna(0)
 
@@ -87,16 +116,21 @@ df["iso_pred"] = iso.fit_predict(X_scaled)
 df["iso_score"] = iso.score_samples(X_scaled)
 
 # Local Outlier Factor trained on scaled features
+# Local Outlier Factor trained on scaled features — continuous scoring version
 lof = LocalOutlierFactor(
     n_neighbors=best_params["lof_n_neighbors"],
     contamination=best_params["lof_contamination"],
+    novelty=True  # ✅ enables scoring on same data
 )
-df["lof_pred"] = lof.fit_predict(X_scaled)
+lof.fit(X_scaled)
+df["lof_score"] = -lof.score_samples(X_scaled)  # higher = more anomalous
+
 
 # --------- Step 5: Improved Hybrid Scoring ---------
 # Normalize the iso_score and lof_pred for hybrid scoring
 df["iso_norm"] = MinMaxScaler().fit_transform(df[["iso_score"]])
-df["lof_norm"] = MinMaxScaler().fit_transform(np.abs(df[["lof_pred"]]))  # LOF outputs -1/1 → abs makes consistent
+df["lof_norm"] = MinMaxScaler().fit_transform(df[["lof_score"]])
+ # LOF outputs -1/1 → abs makes consistent
 
 alpha = best_params.get("alpha", 0.5)
 df["combined_score"] = alpha * df["iso_norm"] + (1 - alpha) * df["lof_norm"]
@@ -107,10 +141,41 @@ over_flag = (df["ratio"] > 1.3).astype(int)
 df["rule_flag"] = under_flag | over_flag
 
 # --- Penalize rule-based issues mildly since normalized ---
-df["final_score"] = df["combined_score"] - df["rule_flag"] * 0.2
+# --- Penalize rule-based issues mildly since normalized ---
+rule_scaled = MinMaxScaler().fit_transform(df[["rule_flag"]]).ravel()  # ✅ flatten to 1D
+
+df["final_score"] = (
+    0.7 * df["combined_score"]
+    + 0.3 * rule_scaled
+    - df["rule_flag"] * 0.2
+)
+
+
+
+# --------- Deep Hybrid Meta Model (Supervised layer) ---------
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+meta_features = df[["iso_score", "lof_score", "rule_flag"]]
+y = df["is_synthetic"].astype(int)  # 1 = synthetic anomaly
+
+X_train, X_test, y_train, y_test = train_test_split(meta_features, y, test_size=0.3, random_state=42)
+meta_model = RandomForestClassifier(n_estimators=100, random_state=42)
+meta_model.fit(X_train, y_train)
+
+y_pred = meta_model.predict(X_test)
+f1 = f1_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred)
+print(f"🤖 Meta Model — F1={f1:.3f}, P={precision:.3f}, R={recall:.3f}")
+
+# Save meta model
+joblib.dump(meta_model, os.path.join(MODEL_DIR, "meta_model.pkl"))
+print("✅ Meta-model (RandomForest) saved successfully.")
 
 # --- Label anomalies: lowest 5% as anomalies ---
-threshold = df["final_score"].quantile(0.05)
+threshold = df["final_score"].quantile(0.08)
 # ✅ Use -1 for anomaly, 1 for normal consistently
 df["anomaly_label"] = np.where(df["final_score"] < threshold, -1, 1)
 
@@ -143,6 +208,23 @@ joblib.dump(feature_scaler, os.path.join(MODEL_DIR, "scaler.pkl"))
 
 # Save processed dataset with features + synthetic anomalies
 df.to_csv(os.path.join(DATA_DIR, "training_with_synthetics.csv"), index=False)
+# --------- Step 7: Save Full Hybrid Components for Backend Compatibility ---------
+# These additional models and scalers ensure the backend runs the *same* hybrid logic (no fallbacks).
+
+# Save LOF model
+joblib.dump(lof, os.path.join(MODEL_DIR, "lof_model.pkl"))
+
+# Save individual scalers for each anomaly score type
+iso_score_scaler = MinMaxScaler().fit(df[["iso_score"]])
+lof_score_scaler = MinMaxScaler().fit(df[["lof_score"]])
+meta_score_scaler = MinMaxScaler().fit(df[["final_score"]])
+
+joblib.dump(iso_score_scaler, os.path.join(MODEL_DIR, "iso_score_scaler.pkl"))
+joblib.dump(lof_score_scaler, os.path.join(MODEL_DIR, "lof_score_scaler.pkl"))
+joblib.dump(meta_score_scaler, os.path.join(MODEL_DIR, "meta_score_scaler.pkl"))
+
+print("✅ Saved LOF model and all hybrid score scalers for backend consistency.")
+
 
 # --------- Logging ---------
 print(f"✅ Model saved to {os.path.join(MODEL_DIR, 'anomaly_model.pkl')}")

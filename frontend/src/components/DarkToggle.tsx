@@ -24,7 +24,7 @@ export default function DarkToggle() {
   return (
     <button
       onClick={toggleTheme}
-      className="fixed top-3 right-3 z-50 bg-gray-200 dark:bg-gray-800 p-2 rounded-full shadow hover:scale-105 transition"
+      className="p-2 rounded-full bg-gray-200 dark:bg-gray-700 shadow hover:scale-105 transition"
       aria-label="Toggle dark mode"
     >
       {dark ? "🌞" : "🌙"}

@@ -1,30 +1,25 @@
 "use client";
-import "@/i18n/client"; // must be first for i18n client
-
-// Global window typing for SpeechRecognition
-declare global {
-  interface Window {
-    SpeechRecognition: any;
-    webkitSpeechRecognition: any;
-  }
-}
-
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import ReactMarkdown from "react-markdown";
-import DarkToggle from "@/components/DarkToggle";
-import { getCustomers, getLive, predict } from "@/lib/api";
 import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-  Label,
-} from "recharts";
+  Bot,
+  RefreshCw,
+  User,
+  Database,
+  AlertTriangle,
+  Repeat,
+  RotateCcw,
+  Send,
+  X,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
+import { getCustomers } from "@/lib/api";
+import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import "@/i18n/client"; // ensure i18n is initialized
 
+// --------------------- Types ---------------------
 type Customer = {
   customer_id: string;
   consumer_category: string;
@@ -33,490 +28,1025 @@ type Customer = {
   monthly_change: number;
   consumption_kwh: number;
   anomaly_label?: number;
-  top_reason?: string;
+  persistent_anomaly?: number;
+  reason?: string;
+  billing_gap?: number;
 };
 
-type LiveRecord = { customer_id: string; month: string; consumption_kwh: number; billed_kwh: number };
-
-export default function Page(): React.ReactElement {
+// --------------------- Copilot (inner component) ---------------------
+function CopilotInner({ i18nLanguage }: { i18nLanguage: string }) {
   const { t, i18n } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
+  const [input, setInput] = useState("");
+  const [soundOn, setSoundOn] = useState(true);
+  const [listening, setListening] = useState(false);
 
-  // Dashboard state
-  const [customers, setCustomers] = useState<Customer[]>([]);
-  const [filteredCustomers, setFilteredCustomers] = useState<Customer[]>([]);
-  const [filter, setFilter] = useState("all");
-  const [live, setLive] = useState<LiveRecord[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [autoRefresh, setAutoRefresh] = useState(false);
-  const [alerts, setAlerts] = useState(0);
-  const [uploading, setUploading] = useState(false);
-  const [uploadMessage, setUploadMessage] = useState("");
-  const [insights, setInsights] = useState<any>(null);
-
-  // Predict
-  const [predictInput, setPredictInput] = useState({ consumption: 0, billed: 0, category: "Residential" });
-  const [predictResult, setPredictResult] = useState<any>(null);
-
-  // Copilot state
-  const [copilotOpen, setCopilotOpen] = useState(false);
-  const [copilotInput, setCopilotInput] = useState("");
-  const [copilotMessages, setCopilotMessages] = useState<{ role: "user" | "bot"; text: string }[]>([]);
-  const [isThinking, setIsThinking] = useState(false);
-  const [isListening, setIsListening] = useState(false);
-  const [audioEnabled, setAudioEnabled] = useState(false);
-
-  // Refs for recognition + audio queue
-  const recognitionRef = useRef<any>(null);
-  const audioQueueRef = useRef<HTMLAudioElement[]>([]);
-  const isPlayingRef = useRef(false);
+  const chatRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const currentAudioUrlRef = useRef<string | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const interimRef = useRef<string>("");
 
+  // Auto-scroll chat when messages change
   useEffect(() => {
-    if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [copilotMessages, isThinking]);
+    if (!open) return;
+    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
+  }, [messages, open]);
 
-  const langMap: Record<string, string> = { en: "en-US", hi: "hi-IN", mr: "mr-IN" };
-  const getLocale = useCallback(() => langMap[i18n.language] || "en-US", [i18n.language]);
+  // Initialize Web Speech recognition (Mic)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      recognitionRef.current = null;
+      return;
+    }
 
-  // ---- Voice recognition ----
-  const startRecognition = useCallback(() => {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) return alert(t("voice.unsupported"));
-    try {
-      recognitionRef.current?.abort?.();
-    } catch {}
-    const r = new SR();
-    r.lang = getLocale();
-    r.interimResults = false;
-    r.maxAlternatives = 1;
-    r.onstart = () => setIsListening(true);
-    r.onresult = (ev: any) => {
-      try {
-        const transcript = ev.results[0][0].transcript;
-        setCopilotInput(transcript);
-      } catch {}
-      setIsListening(false);
+    // if existing, abort
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch {}
+      recognitionRef.current = null;
+    }
+
+    const recog = new SpeechRecognition();
+    // set language from i18n if available
+    const lang = i18n.language || i18nLanguage || "en";
+    if (lang.startsWith("hi")) recog.lang = "hi-IN";
+    else if (lang.startsWith("mr")) recog.lang = "mr-IN";
+    else recog.lang = "en-IN";
+
+    recog.interimResults = true;
+    recog.maxAlternatives = 1;
+
+    recog.onstart = () => {
+      setListening(true);
+      interimRef.current = "";
     };
-    r.onerror = () => setIsListening(false);
-    r.onend = () => setIsListening(false);
+    recog.onend = () => {
+      setListening(false);
+      if (interimRef.current) {
+        setInput((s) => (s ? s + " " + interimRef.current : interimRef.current));
+        interimRef.current = "";
+      }
+    };
+    recog.onerror = (e: any) => {
+      console.warn("Speech error", e);
+      setListening(false);
+    };
+    recog.onresult = (evt: any) => {
+      let interim = "";
+      let final = "";
+      for (let i = evt.resultIndex; i < evt.results.length; ++i) {
+        const r = evt.results[i];
+        if (r.isFinal) final += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      if (final) {
+        setInput((s) => (s ? s + " " + final : final));
+      } else {
+        interimRef.current = interim;
+      }
+    };
+
+    recognitionRef.current = recog;
+    return () => {
+      try { recog.abort(); } catch {}
+      recognitionRef.current = null;
+    };
+  }, [i18n.language, i18nLanguage]);
+
+  const startListening = () => {
+    const r = recognitionRef.current;
+    if (!r) {
+      alert(t("voice.unsupported") || "Voice not supported in this browser");
+      return;
+    }
     try {
       r.start();
-      recognitionRef.current = r;
-    } catch (err) {
-      console.warn("SR start failed", err);
+    } catch {
+      try { r.abort(); r.start(); } catch {}
     }
-  }, [getLocale, t]);
-
-  const stopRecognition = useCallback(() => {
-    try {
-      recognitionRef.current?.stop?.();
-    } catch {}
-    setIsListening(false);
-  }, []);
-
-  const toggleVoice = useCallback(() => {
-    if (isListening) stopRecognition();
-    else startRecognition();
-  }, [isListening, startRecognition, stopRecognition]);
-
-  // ---- TTS queue ----
-  const cleanText = (s: string) => s.replace(/[*_#`~>]/g, "").replace(/\s{2,}/g, " ").replace(/\[(.*?)\]\(.*?\)/g, "$1").trim();
-
-  const enqueueAudio = async (blob: Blob) => {
-    const url = URL.createObjectURL(blob);
-    const a = new Audio(url);
-    audioQueueRef.current.push(a);
-
-    const playNext = () => {
-      if (isPlayingRef.current) return;
-      const next = audioQueueRef.current.shift();
-      if (!next) return;
-      isPlayingRef.current = true;
-      audioRef.current = next;
-      next.onended = () => {
-        try {
-          URL.revokeObjectURL(next.src);
-        } catch {}
-        isPlayingRef.current = false;
-        audioRef.current = null;
-        playNext();
-      };
-      void next.play().catch((err) => {
-        console.warn("audio play failed", err);
-        isPlayingRef.current = false;
-        audioRef.current = null;
-        playNext();
-      });
-    };
-
-    playNext();
+  };
+  const stopListening = () => {
+    const r = recognitionRef.current;
+    try { r.stop(); } catch {}
+    setListening(false);
   };
 
-  const clearAudioQueue = () => {
+  // TTS play
+  const playTTS = async (text: string) => {
+    if (!soundOn) return;
     try {
       if (audioRef.current) {
-        audioRef.current.pause();
-        try {
-          URL.revokeObjectURL(audioRef.current.src);
-        } catch {}
+        try { audioRef.current.pause(); } catch {}
+        if (currentAudioUrlRef.current) URL.revokeObjectURL(currentAudioUrlRef.current);
         audioRef.current = null;
+        currentAudioUrlRef.current = null;
       }
+      const resp = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, lang: i18n.language || i18nLanguage || "en" }) });
+      if (!resp.ok) return;
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      currentAudioUrlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => {
+        try { if (currentAudioUrlRef.current) URL.revokeObjectURL(currentAudioUrlRef.current); } catch {}
+        audioRef.current = null; currentAudioUrlRef.current = null;
+      };
+      await audio.play();
+    } catch (err) {
+      console.warn("TTS error", err);
+    }
+  };
+  // stop audio if chat closed
+useEffect(() => {
+  if (!open && audioRef.current) {
+    try {
+      audioRef.current.pause();
+      if (currentAudioUrlRef.current)
+        URL.revokeObjectURL(currentAudioUrlRef.current);
     } catch {}
-    while (audioQueueRef.current.length) {
-      const a = audioQueueRef.current.shift()!;
-      try {
-        URL.revokeObjectURL(a.src);
-      } catch {}
-    }
-    isPlayingRef.current = false;
-  };
+  }
+}, [open]);
 
-  const speakText = async (text: string) => {
-    if (!audioEnabled) return;
+
+  const sendMessage = async (textArg?: string) => {
+    const text = (textArg ?? input).trim();
+    if (!text) return;
+    setMessages((m) => [...m, { role: "user", content: text }]);
+    setInput("");
+    setIsSending(true);
+
+    // stop any audio playing
     try {
-      const cleaned = cleanText(text);
-      const res = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: cleaned, lang: getLocale() }) });
-      if (!res.ok) throw new Error("TTS failed");
-      const blob = await res.blob();
-      await enqueueAudio(blob);
-    } catch (err) {
-      console.error("TTS error", err);
-    }
-  };
-
-  useEffect(() => {
-    if (!audioEnabled) clearAudioQueue();
-  }, [audioEnabled]);
-
-  // --- Copilot streaming send ---
-  const handleCopilotSend = useCallback(async () => {
-    if (!copilotInput.trim()) return;
-    const q = copilotInput;
-    setCopilotMessages((m) => [...m, { role: "user", text: q }]);
-    setCopilotInput("");
-    setIsThinking(true);
-    // placeholder bot message that we'll update
-    setCopilotMessages((m) => [...m, { role: "bot", text: "" }]);
+      if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+      if (currentAudioUrlRef.current) { URL.revokeObjectURL(currentAudioUrlRef.current); currentAudioUrlRef.current = null; }
+    } catch {}
 
     try {
-      const res = await fetch("/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: q }) });
+      const res = await fetch("/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: text, lang: i18n.language || i18nLanguage || "en" }) });
+      if (!res.ok) {
+        const txt = await res.text();
+        setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${t("copilot_err") || "Copilot error"}: ${txt}` }]);
+        return;
+      }
+
+      // streaming reader if available
       const reader = res.body?.getReader();
-      if (!reader) throw new Error("no reader");
-      const dec = new TextDecoder();
-      let buffer = "";
-      let sentenceBuffer = "";
+      const decoder = new TextDecoder();
+      let assistantText = "";
+      // placeholder
+      setMessages((m) => [...m, { role: "assistant", content: "" }]);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = dec.decode(value, { stream: true });
-        buffer += chunk;
-        sentenceBuffer += chunk;
-
-        // Update chat text in real-time
-        setCopilotMessages((msgs) => {
-          const copy = [...msgs];
-          const idx = copy.map((x) => x.role).lastIndexOf("bot");
-          if (idx >= 0) copy[idx] = { role: "bot", text: buffer };
-          return copy;
-        });
-
-        // Sentence synchronization
-        const sentences = sentenceBuffer.split(/(?<=[.!?])\s+/);
-        while (sentences.length > 1) {
-          const sentence = sentences.shift()!.trim();
-          if (audioEnabled && sentence.length > 4) {
-            await speakText(sentence); // speak sentence as soon as complete
-          }
+      if (reader) {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          assistantText += chunk;
+          setMessages((m) => {
+            const cp = [...m];
+            cp[cp.length - 1] = { role: "assistant", content: assistantText };
+            return cp;
+          });
         }
-        sentenceBuffer = sentences.join(" ");
+      } else {
+        const full = await res.text();
+        assistantText = full;
+        setMessages((m) => {
+          const cp = [...m];
+          cp[cp.length - 1] = { role: "assistant", content: assistantText };
+          return cp;
+        });
       }
 
-      // After stream ends, speak leftover sentence
-      if (audioEnabled && sentenceBuffer.trim().length) {
-        await speakText(sentenceBuffer.trim());
-      }
-
-      setIsThinking(false);
+      if (soundOn) playTTS(assistantText);
     } catch (err) {
-      console.error(err);
-      setCopilotMessages((m) => [...m, { role: "bot", text: t("copilot.error") }]);
-      setIsThinking(false);
+      console.error("Copilot send error:", err);
+      setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${t("copilot_err") || "Copilot error — check backend."}` }]);
+    } finally {
+      setIsSending(false);
     }
-  }, [copilotInput, audioEnabled, getLocale, t]);
+  };
 
-  // Data fetching
+  // Copilot panel CSS: resizable edges (bounded via min/max inline styles)
+  // Note: CSS 'resize' is used; user can resize from edges/corner. We keep sensible min/max.
+  return (
+    <>
+      {/* Floating toggle button */}
+      <button
+        onClick={() => setOpen((s) => !s)}
+        aria-label={t("copilot.open_copilot")}
+        className="fixed bottom-6 right-6 z-50 w-12 h-12 rounded-full flex items-center justify-center text-white shadow-2xl bg-gradient-to-r from-purple-600 to-fuchsia-600"
+      >
+        <Bot size={22} />
+      </button>
+
+      {open && (
+ <div
+  ref={chatRef}
+  style={{
+    width: 600,
+    maxHeight: 500, // stops growing after this
+    height: "auto",
+    transition: "height 0.3s ease, width 0.3s ease",
+    overflowY: messages.length > 3 ? "auto" : "visible",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+  }}
+  className="fixed bottom-24 right-6 z-[9999]
+             bg-gradient-to-br from-purple-600/10 via-fuchsia-500/10 to-white/20
+             dark:from-purple-900/40 dark:via-fuchsia-800/30 dark:to-transparent
+             border border-purple-400/30 backdrop-blur-2xl
+             rounded-2xl shadow-[0_0_20px_rgba(168,85,247,0.25)]"
+>
+
+
+
+
+          {/* header */}
+          <div className="flex items-center justify-between px-4 py-3 bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white">
+            <div className="flex items-center gap-2 font-semibold"><Bot size={16} /> WattAudit Copilot</div>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setMessages([])} title={t("copilot.clear")} className="p-1 rounded-full hover:bg-white/20"><RotateCcw size={16} /></button>
+              <button onClick={() => setOpen(false)} title={t("copilot.close")} className="p-1 rounded-full hover:bg-white/20"><X size={16} /></button>
+            </div>
+          </div>
+
+          {/* chat area */}
+          <div style={{ maxHeight: '45vh' }} ref={chatRef} className="p-4 overflow-y-auto space-y-3 text-sm bg-transparent">
+            {messages.length === 0 ? (
+              <div className="text-center text-gray-500 italic">🤖 {t("start_chat") || "Start chatting with your AI Copilot..."}</div>
+            ) : (
+              messages.map((m, i) => (
+                <div key={i} className={`max-w-[85%] rounded-2xl px-4 py-3 shadow-md ${m.role === "user" ? "ml-auto bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white" : "mr-auto bg-white/90 text-gray-900 dark:bg-[#1b1630] dark:text-gray-100 border border-white/10"}`}>
+                 {m.role === "assistant" ? (
+  <div className={`${isSending ? "animate-pulse text-purple-500" : ""}`}>
+    <ReactMarkdown rehypePlugins={[rehypeRaw]}>{m.content}</ReactMarkdown>
+  </div>
+) : (
+  <div>{m.content}</div>
+)}
+
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* status / shimmer for generating or listening */}
+          <div className="px-4">
+            {/* vivid shimmer rectangle (shows when sending or listening) */}
+            <div className="mt-3">
+              {isSending && (
+                <div className="w-full rounded-lg p-3 shimmer-rect text-white text-sm">
+                  {t("generating_insights") || "Generating response..."}
+                </div>
+              )}
+              {listening && (
+                  <div className="mt-2 text-sm font-medium text-emerald-400 animate-pulse">
+    🎤 {input || t("voice.listening") || "Listening..."}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* input row */}
+          <form onSubmit={(e) => { e.preventDefault(); if (!isSending) sendMessage(); }} className="p-3 border-t border-white/10 bg-white/5 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                if (listening) stopListening();
+                else startListening();
+              }}
+              title={t("voice.start") || "Voice input"}
+              className={`p-2 rounded-full ${listening ? 'bg-purple-600 text-white' : 'bg-white/10'}`}
+            >
+              🎤
+            </button>
+
+            <button type="button" onClick={() => setSoundOn((s) => !s)} title={soundOn ? t("playback.pause") || "Mute" : t("playback.resume") || "Unmute"} className={`p-2 rounded-full ${soundOn ? 'bg-white/10' : 'bg-white/5'}`}>
+              {soundOn ? <Volume2 size={16} /> : <VolumeX size={16} />}
+            </button>
+
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={t("copilot.placeholder") || "Ask in English / Hindi / Marathi..."}
+              className="flex-1 rounded-full px-4 py-2 text-sm bg-white/80 dark:bg-[#1b1630] border border-white/10 focus:outline-none focus:ring-2 focus:ring-purple-300 text-gray-900"
+            />
+
+            <button disabled={isSending} type="submit" className="p-2 rounded-full bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white shadow-md" title={t("send") || "Send"}>
+              <Send size={16} />
+            </button>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
+// --------------------- Dashboard Page (main) ---------------------
+export default function DashboardPage(): React.ReactElement {
+  const { t, i18n } = useTranslation();
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [filtered, setFiltered] = useState<Customer[]>([]);
+  const [alerts, setAlerts] = useState(0);
+  const [insights, setInsights] = useState<any>(null);
+  const [insightsSummary, setInsightsSummary] = useState<string | null>(null);
+  const [insightsGenerating, setInsightsGenerating] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const [tab, setTab] = useState<"all" | "alerts" | "stable">("all");
+  const [search, setSearch] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState<string>("All");
+  const [page, setPage] = useState(1);
+  const perPage = 25;
+  const [sortKey, setSortKey] = useState<keyof Customer | null>("avg_anomaly_score");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  // local language state so we reload on change
+  const [langState, setLangState] = useState<string>(i18n.language || (typeof window !== "undefined" ? (localStorage.getItem("lang") || "en") : "en"));
+useEffect(() => {
+  const saved = typeof window !== "undefined" ? localStorage.getItem("lang") : null;
+  if (saved && i18n.language !== saved) i18n.changeLanguage(saved);
+
+  const onChange = (lng: string) => {
+    setLangState(lng);
+    if (typeof window !== "undefined") localStorage.setItem("lang", lng);
+  };
+
+  i18n.on("languageChanged", onChange);
+  return () => i18n.off("languageChanged", onChange);
+}, [i18n.language]);
+
+
+
+  // fetch customers & compute quick insights
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const res = await getCustomers();
-      if (!mounted) return;
-      setCustomers(res.top_customers || []);
-      setFilteredCustomers(res.top_customers || []);
-      setAlerts(res.total_alerts || 0);
-      setInsights(res.insights || null);
-      setLoading(false);
-    })();
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    let timer: NodeJS.Timeout;
-    const fetchLive = async () => {
-      const r = await getLive(100);
-      if (Array.isArray(r)) setLive(r);
-    };
-    fetchLive();
-    if (autoRefresh) timer = setInterval(fetchLive, 5000);
-    return () => clearInterval(timer);
-  }, [autoRefresh]);
-
-  useEffect(() => {
-    if (filter === "all") setFilteredCustomers(customers);
-    else if (filter === "alerts") setFilteredCustomers(customers.filter((c) => c.anomaly_label === -1));
-    else if (filter === "stable") setFilteredCustomers(customers.filter((c) => c.anomaly_label === 1));
-  }, [filter, customers]);
-
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUploading(true);
-    setUploadMessage("");
-    const form = new FormData();
-    form.append("file", file);
-    try {
-      const r = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/upload_dataset`, { method: "POST", body: form });
-      const data = await r.json();
-      setUploadMessage(data.message || data.error || t("upload.complete"));
-    } catch (err) {
-      setUploadMessage(t("upload.failed"));
-    }
-    setUploading(false);
-  };
-
-  const handlePredict = async () => {
-    const resp = await predict({ consumption_kwh: predictInput.consumption, billed_kwh: predictInput.billed, category: predictInput.category });
-    setPredictResult(resp);
-  };
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setCopilotOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  useEffect(() => {
-    // restart recognition if locale changed while listening
-    if (recognitionRef.current && isListening) {
       try {
-        recognitionRef.current?.abort?.();
-      } catch {}
-      startRecognition();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [i18n.language]);
+        const res = await getCustomers();
+        if (!mounted) return;
+        const rows = res.top_customers || [];
+        setCustomers(rows);
+        setFiltered(rows);
+        setAlerts(res.total_alerts || 0);
 
-  const chartData = customers.slice(0, 12).map((c) => ({ name: c.customer_id, score: c.avg_anomaly_score }));
+        if (rows.length) {
+          const reasonCounts: Record<string, number> = {};
+          const catScores: Record<string, number[]> = {};
+          let persistentCount = 0;
+          rows.forEach((r: any) => {
+            const reasonKey = (r.reason || "Unknown").split("|")[0].trim();
+            reasonCounts[reasonKey] = (reasonCounts[reasonKey] || 0) + 1;
+            const cat = r.consumer_category || "Unknown";
+            if (!catScores[cat]) catScores[cat] = [];
+            catScores[cat].push(Number(r.avg_anomaly_score ?? 0));
+            if (r.persistent_anomaly) persistentCount++;
+          });
+
+          const top_reason = Object.entries(reasonCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || "N/A";
+          const riskiest_category = Object.entries(catScores).map(([k, v]) => ({ k, avg: v.reduce((s, x) => s + x, 0) / Math.max(1, v.length) })).sort((a, b) => b.avg - a.avg)[0]?.k || "N/A";
+          const flagged = rows.filter((r: any) => r.anomaly_label === -1).length;
+          const alert_rate = rows.length ? Math.round((flagged / rows.length) * 100) : 0;
+
+          setInsights({ top_reason, riskiest_category, alert_rate, persistent_count: persistentCount, total: rows.length });
+          generateQuickInsights(rows, mounted);
+        } else {
+          setInsights(null);
+          setInsightsSummary(null);
+        }
+      } catch (err) {
+        console.error("Failed to fetch customers", err);
+        setCustomers([]);
+        setFiltered([]);
+        setInsights(null);
+      } finally {
+        setLoading(false);
+      }
+    })();
+    return () => { mounted = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [langState]);
+
+  // generate quick insights (streaming)
+  const generateQuickInsights = async (rows: any[], mountedFlag = true) => {
+    if (!rows || rows.length === 0) return;
+    setInsightsGenerating(true);
+    setInsightsSummary(null);
+    try {
+      const prompt = [
+        "You are an analytics copilot. Provide a concise, high-value summary of anomaly data.",
+        `Language: ${i18n.language || langState}`,
+        "Data (JSON array):",
+        JSON.stringify(rows.slice(0, 50)),
+      ].join("\n\n");
+
+      const res = await fetch("/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: prompt, lang: i18n.language || langState }) });
+      if (!res.ok) { setInsightsSummary("⚠️ AI service unavailable. Try again later."); setInsightsGenerating(false); return; }
+
+      let dataText = "";
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      if (reader) {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          dataText += chunk;
+          if (!mountedFlag) break;
+          setInsightsSummary(dataText);
+        }
+      } else {
+        dataText = await res.text();
+        setInsightsSummary(dataText);
+      }
+    } catch (err) {
+      console.error("Insights error:", err);
+      setInsightsSummary("⚠️ Something went wrong. Please retry.");
+    } finally {
+      setInsightsGenerating(false);
+    }
+  };
+
+  // Spark bar mini
+  const Spark = ({ value }: { value: number }) => {
+    const v = Math.max(-1, Math.min(1, value));
+    const bar = Math.abs(v) * 100;
+    const color = v < -0.05 ? "#ef4444" : v > 0.05 ? "#34d399" : "#a855f7";
+    return (
+      <div className="w-28 h-2 bg-gray-100 rounded overflow-hidden">
+        <div style={{ width: `${bar}%`, background: color, height: 8, borderRadius: 4 }} />
+      </div>
+    );
+  };
+
+  // filtering/sorting
+ useEffect(() => {
+  const s = search.trim().toLowerCase();
+  let out = customers.slice();
+
+  // Tabs logic
+  if (tab === "alerts")
+    out = out.filter(
+      (c) => c.anomaly_label === -1 || c.persistent_anomaly === 1
+    );
+  if (tab === "stable")
+    out = out.filter(
+      (c) => c.anomaly_label === 1 && c.persistent_anomaly !== 1
+    );
+
+  // Category filter
+  if (categoryFilter && categoryFilter !== "All") {
+    out = out.filter(
+      (c) => (c.consumer_category || "Unknown") === categoryFilter
+    );
+  }
+
+  // Search
+  if (s) {
+    out = out.filter((c) =>
+      c.customer_id.toLowerCase().includes(s)
+    );
+  }
+
+  // Sorting
+  if (sortKey) {
+    out.sort((a: any, b: any) => {
+      const av = a[sortKey] ?? 0;
+      const bv = b[sortKey] ?? 0;
+      return sortDir === "asc" ? av - bv : bv - av;
+    });
+  }
+
+  setFiltered(out);
+  setPage(1);
+}, [customers, tab, search, categoryFilter, sortKey, sortDir]);
+
+ const categories = useMemo(() => {
+  const setC = new Set<string>();
+  customers.forEach((c) =>
+    setC.add(c.consumer_category || "Unknown")
+  );
+  return ["All", ...Array.from(setC).sort()];
+}, [customers]);
+
+ const pageCount = Math.max(1, Math.ceil(filtered.length / perPage));
+const pageItems = filtered.slice(
+  (page - 1) * perPage,
+  page * perPage
+);
+ const toggleSort = (key: keyof Customer) => {
+  if (sortKey === key)
+    setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+  else {
+    setSortKey(key);
+    setSortDir("desc");
+  }
+};
+
+  // Inline CSS for shimmer, pulses, hover glows (move to globals.css if you prefer)
+const InlineStyles = (
+  <style>{`
+    @keyframes vivid-shimmer {
+      0% { background-position: -250% 0; }
+      100% { background-position: 250% 0; }
+    }
+
+    .hover-glow:hover {
+      box-shadow: 0 0 20px rgba(168, 85, 247, 0.2);
+      transform: translateY(-3px);
+      transition: all 0.25s ease;
+    }
+
+    .shimmer-rect {
+      background: linear-gradient(
+        90deg,
+        rgba(216, 180, 254, 0.25) 0%,
+        rgba(232, 121, 249, 0.35) 50%,
+        rgba(216, 180, 254, 0.25) 100%
+      );
+      background-size: 300% 100%;
+      animation: vivid-shimmer 5s ease-in-out infinite;
+      border-radius: 12px;
+      box-shadow:
+        0 0 16px rgba(216, 180, 254, 0.25),
+        0 0 32px rgba(168, 85, 247, 0.15),
+        inset 0 0 8px rgba(255, 255, 255, 0.05);
+    }
+
+    .card-hover:hover {
+      box-shadow: 0 12px 40px rgba(168,85,247,0.08);
+      transform: translateY(-4px);
+      transition: all 220ms ease;
+    }
+
+    .glow-tab:hover {
+      box-shadow: 0 0 20px rgba(168,85,247,0.18);
+      transform: translateY(-3px);
+      transition: all 180ms ease;
+    }
+
+    .table-row-hover:hover {
+      background: linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+      box-shadow: inset 0 0 0 1px rgba(168,85,247,0.02);
+      transition: all 160ms ease;
+    }
+
+    /* --- Enhanced table visuals --- */
+    .dashboard-table {
+      border-collapse: separate;
+      border-spacing: 0;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .dashboard-table thead {
+      background: linear-gradient(
+        90deg,
+        rgba(236, 72, 153, 0.06),
+        rgba(168, 85, 247, 0.08)
+      );
+      color: rgba(88, 28, 135, 0.9);
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .dashboard-table th {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid rgba(168, 85, 247, 0.12);
+      backdrop-filter: blur(4px);
+    }
+
+    .dashboard-table td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid rgba(168, 85, 247, 0.06);
+    }
+
+    .dashboard-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .dashboard-table tbody tr:hover {
+      background: linear-gradient(
+        90deg,
+        rgba(216, 180, 254, 0.08),
+        rgba(236, 72, 153, 0.06)
+      );
+      box-shadow: inset 0 0 0 1px rgba(168, 85, 247, 0.08);
+      transition: all 0.25s ease;
+    }
+
+    .regenerate-btn {
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      padding:8px;
+      border-radius:999px;
+      background:linear-gradient(90deg,#7c3aed,#ec4899);
+      color:white;
+      box-shadow: 0 6px 26px rgba(124,58,237,0.18);
+      border:none;
+      cursor:pointer;
+    }
+
+    .regenerate-btn:hover {
+      transform: scale(1.06);
+      box-shadow: 0 10px 40px rgba(124,58,237,0.28);
+      transition: all 180ms ease;
+    }
+
+    :root {
+      color-scheme: light dark;
+    }
+
+    /* 🌑 True rich dark gradient background */
+    html.dark {
+      background: #0e0a1f !important;
+      color: #f4f0ff;
+    }
+
+    /* card and surface transparency */
+    .dark .bg-white\\/60,
+    .dark .bg-white\\/40,
+    .dark .bg-white\\/30,
+    .dark .bg-white\\/80 {
+      background-color: #19142c !important;
+      color: #f5f3ff !important;
+    }
+
+    .dark .dashboard-table {
+      background-color: rgba(255, 255, 255, 0.05);
+      border-radius: 12px;
+    }
+
+    .dark .dashboard-table th,
+    .dark .dashboard-table td {
+      border-color: rgba(255, 255, 255, 0.1);
+    }
+
+    .dark .bg-white\\/40 {
+      background-color: rgba(30, 15, 50, 0.4) !important;
+    }
+
+    .dark .bg-white\\/30 {
+      background-color: rgba(25, 10, 45, 0.35) !important;
+    }
+
+    .dark .bg-white\\/80 {
+      background-color: rgba(45, 25, 70, 0.75) !important;
+    }
+
+    /* text and borders */
+    .dark .text-gray-900,
+    .dark .text-gray-800 {
+      color: #f3f0ff !important;
+    }
+
+    .dark .text-gray-700,
+    .dark .text-gray-600 {
+      color: #e9e6f7 !important;
+    }
+
+    .dark .border-white\\/10,
+    .dark .border-white\\/20 {
+      border-color: rgba(255, 255, 255, 0.08) !important;
+    }
+
+    /* subtle card glow */
+    .dark .card-hover:hover {
+      box-shadow: 0 0 30px rgba(168, 85, 247, 0.15);
+    }
+
+    /* gradient-based hover shimmer for tabs */
+    .dark .glow-tab:hover {
+      box-shadow: 0 0 22px rgba(200, 120, 255, 0.25);
+    }
+
+    /* 🌈 Metric card glow */
+    .metric-card {
+      border: 1px solid rgba(168, 85, 247, 0.25);
+      box-shadow:
+        0 0 15px rgba(168, 85, 247, 0.15),
+        inset 0 0 8px rgba(255, 255, 255, 0.05);
+      transition: all 0.3s ease;
+    }
+
+    .card-hover {
+      box-shadow: 0 0 30px rgba(168, 85, 247, 0.25);
+      transform: translateY(0);
+    }
+
+    .metric-card:hover {
+      box-shadow:
+        0 0 25px rgba(168, 85, 247, 0.25),
+        0 0 40px rgba(236, 72, 153, 0.15);
+      transform: translateY(-3px);
+    }
+
+    /* 💫 Panels glow (Quick Insights & Top Flagged) */
+    .panel-card {
+      border: 1px solid rgba(168, 85, 247, 0.2);
+      box-shadow:
+        0 0 20px rgba(168, 85, 247, 0.12),
+        inset 0 0 8px rgba(255, 255, 255, 0.03);
+      transition: all 0.3s ease;
+    }
+
+    .panel-card:hover {
+      box-shadow: 0 0 35px rgba(168, 85, 247, 0.25);
+    }
+
+    /* 🌑 Dark mode variations */
+    .dark .metric-card {
+      border: 1px solid rgba(200, 120, 255, 0.25);
+      box-shadow: 0 0 25px rgba(168, 85, 247, 0.1);
+      background-color: rgba(25, 15, 45, 0.65) !important;
+    }
+
+    .dark .metric-card:hover {
+      box-shadow: 0 0 40px rgba(168, 85, 247, 0.25);
+    }
+
+    .dark .panel-card {
+      border: 1px solid rgba(200, 120, 255, 0.2);
+      background-color: rgba(20, 10, 40, 0.7) !important;
+      box-shadow: 0 0 20px rgba(168, 85, 247, 0.1);
+    }
+
+    .dark .panel-card:hover {
+      box-shadow: 0 0 35px rgba(168, 85, 247, 0.25);
+    }
+
+    /* 🌙 Dark mode readability improvements */
+    .dark input,
+    .dark select,
+    .dark textarea {
+      background-color: rgba(40, 25, 65, 0.8) !important;
+      color: #f3e8ff !important;
+      border: 1px solid rgba(200, 120, 255, 0.25) !important;
+    }
+
+    .dark input::placeholder,
+    .dark select::placeholder,
+    .dark textarea::placeholder {
+      color: rgba(220, 180, 255, 0.6) !important;
+    }
+
+    /* 🌙 Fix filter buttons & dropdown contrast in dark mode */
+    .dark .bg-gray-100,
+    .dark .bg-white,
+    .dark .bg-white\\/60 {
+      background-color: rgba(35, 25, 60, 0.9) !important;
+      color: #e5d5ff !important;
+      border-color: rgba(200, 120, 255, 0.3) !important;
+    }
+
+    .dark button.text-gray-700,
+    .dark select.text-gray-700,
+    .dark input.text-gray-700 {
+      color: #e5d5ff !important;
+    }
+
+    .dark .glow-tab:hover {
+      color: #ffffff !important;
+      background-color: rgba(150, 80, 220, 0.3) !important;
+      box-shadow: 0 0 12px rgba(168, 85, 247, 0.25);
+    }
+
+    /* Dropdown caret visibility fix */
+    .dark select {
+      background-color: rgba(35, 25, 60, 0.9) !important;
+      background-image: linear-gradient(45deg, transparent 50%, #c084fc 50%),
+                        linear-gradient(135deg, #c084fc 50%, transparent 50%);
+      background-position: calc(100% - 15px) calc(1em + 2px),
+                           calc(100% - 10px) calc(1em + 2px);
+      background-size: 5px 5px, 5px 5px;
+      background-repeat: no-repeat;
+    }
+
+    /* 🌑 Dark mode fix for white table bg */
+    .dark .dashboard-table {
+      background-color: rgba(25, 15, 45, 0.8) !important;
+      backdrop-filter: blur(8px);
+    }
+
+    .dark .dashboard-table thead {
+      background: rgba(45, 25, 70, 0.7) !important;
+    }
+
+    .dark .dashboard-table tbody tr {
+      background: rgba(25, 15, 45, 0.6);
+    }
+
+    .dark .dashboard-table tbody tr:nth-child(even) {
+      background: rgba(25, 15, 45, 0.5);
+    }
+
+    .dark .dashboard-table tbody tr:hover {
+      background: linear-gradient(
+        90deg,
+        rgba(150, 80, 220, 0.25),
+        rgba(200, 120, 255, 0.2)
+      ) !important;
+    }
+  `}</style>
+);
+
 
   return (
-    <div className="min-h-screen p-6 space-y-6">
-      <header className="flex justify-between items-center">
-        <h1 className="text-2xl font-bold flex gap-2 items-center">
-          ⚡ {t("app.title")} <span className="text-blue-500">{t("app.subtitle")}</span>
-        </h1>
-        <div className="flex gap-3 items-center">
-          <button onClick={() => location.reload()} className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 transition">
-            {t("button.refresh")}
-          </button>
-          <DarkToggle />
-        </div>
-      </header>
+    <div className="min-h-screen py-10 text-gray-900">
+      {InlineStyles}
 
-      <div className="bg-emerald-50 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-100 p-3 rounded shadow text-sm">📡 {t("status.live_mode")}</div>
-
-      {insights && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-            <div className="text-sm text-gray-500">{t("insights.top_reason")}</div>
-            <div className="text-xl font-semibold">{insights.top_reason}</div>
-          </div>
-          <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-            <div className="text-sm text-gray-500">{t("insights.riskiest_category")}</div>
-            <div className="text-xl font-semibold">{insights.riskiest_category}</div>
-          </div>
-          <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-            <div className="text-sm text-gray-500">{t("insights.alerts_vs_last_week")}</div>
-            <div className="text-xl font-semibold">{insights.alert_change}%</div>
-          </div>
-        </div>
-      )}
-
-      <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
-        <h3 className="font-semibold mb-2">{t("upload.heading")}</h3>
-        <input type="file" accept=".csv" onChange={handleUpload} disabled={uploading} />
-        {uploadMessage && <p className="text-sm mt-1">{uploadMessage}</p>}
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-          <div className="text-sm text-gray-500">{t("metrics.total_customers")}</div>
-          <div className="text-2xl font-bold">{customers.length}</div>
-        </div>
-        <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-          <div className="text-sm text-gray-500">{t("metrics.ai_alerts")}</div>
-          <div className="text-2xl font-bold text-red-500">{alerts}</div>
-        </div>
-        <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
-          <div className="text-sm text-gray-500">{t("metrics.data_source")}</div>
-          <div className="text-2xl font-bold">{t("metrics.data_source_value")}</div>
-        </div>
-      </div>
-
-      <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
-        <h3 className="font-semibold mb-3">{t("chart.title")}</h3>
-        <div style={{ height: 260 }}>
-          <ResponsiveContainer>
-            <BarChart data={chartData}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="name">
-                <Label value={t("chart.customer_id")} offset={-5} position="insideBottom" />
-              </XAxis>
-              <YAxis>
-                <Label value={t("chart.score")} angle={-90} position="insideLeft" />
-              </YAxis>
-              <Tooltip />
-              <Bar dataKey="score" fill="#6366F1" />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-
-        {/* Customer Table */}
-        <div className="bg-white dark:bg-gray-800 rounded p-4 shadow">
-          <div className="flex justify-between items-center mb-3">
-            <h4 className="font-semibold">{t("table.title")}</h4>
-            <div className="flex gap-2 text-sm">
-              {["all", "alerts", "stable"].map((f) => (
-                <button
-                  key={f}
-                  onClick={() => setFilter(f)}
-                  className={`px-3 py-1 rounded transition ${
-                    filter === f
-                      ? "bg-blue-600 text-white"
-                      : "bg-gray-200 dark:bg-gray-700"
-                  }`}
-                >
-                  {t(`filters.${f}`)}
-                </button>
-              ))}
+      {/* Top Cards */}
+      <section className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        {[
+          { icon: <User size={20} />, color: "from-purple-500 to-fuchsia-500", label: t("metrics.total_customers") || "Total Customers", value: customers.length },
+          { icon: <AlertTriangle size={20} />, color: "from-rose-600 to-rose-400", label: t("metrics.ai_alerts") || "AI Alerts", value: alerts },
+          { icon: <Repeat size={20} />, color: "from-amber-600 to-amber-400", label: t("metrics.persistent_anomalies") || "Persistent Anomalies", value: customers.filter((c) => c.persistent_anomaly === 1).length },
+          { icon: <Database size={20} />, color: "from-emerald-600 to-emerald-400", label: t("metrics.data_source") || "Data Source", value: t("local_neon") || "Local / Neon" },
+        ].map((c, i) => (
+          <div key={i} className="metric-card bg-white/60 backdrop-blur-xl rounded-xl p-4 flex items-center gap-3">
+            <div className={`p-3 rounded-full text-white bg-gradient-to-br ${c.color}`}>{c.icon}</div>
+            <div>
+              <div className="text-xs opacity-70">{c.label}</div>
+              <div className="text-2xl font-semibold">{c.value}</div>
             </div>
           </div>
+        ))}
+      </section>
 
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="bg-gray-100 dark:bg-gray-700">
-                <tr>
-                  <th className="p-2 text-left">{t("table.customer")}</th>
-                  <th className="p-2">{t("table.category")}</th>
-                  <th className="p-2">{t("table.score")}</th>
-                  <th className="p-2">{t("table.status")}</th>
-                  <th className="p-2">{t("table.badge")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredCustomers.slice(0, 50).map((c, i) => {
-                  const anomalous =
-                    c.anomaly_label === -1 || c.avg_anomaly_score < -0.05;
-                  const badge =
-                    c.top_reason || (anomalous ? t("badge.anomaly") : t("badge.normal"));
-                  return (
-                    <tr
-                      key={i}
-                      className="border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-900"
-                    >
-                      <td className="p-2 text-blue-600 dark:text-blue-400 hover:underline">
-                        <a href={`/customer/${c.customer_id}`} target="_blank">
-                          {c.customer_id}
-                        </a>
-                      </td>
-                      <td className="p-2">{c.consumer_category}</td>
-                      <td className="p-2">{c.avg_anomaly_score.toFixed(4)}</td>
-                      <td
-                        className={`p-2 ${
-                          anomalous ? "text-red-600" : "text-green-600"
-                        }`}
-                      >
-                        {anomalous ? t("status.anomalous") : t("status.normal")}
-                      </td>
-                      <td className="p-2">{badge}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
+      {/* Top flagged + insights */}
+      <section className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
 
-        <div className="bg-white dark:bg-gray-800 rounded p-4 shadow space-y-3">
-          <h4 className="font-semibold">{t("predict.title")}</h4>
-        <div className="flex flex-col md:flex-row gap-2">
-          <input type="number" placeholder={t("predict.consumption")} value={predictInput.consumption} onChange={(e) => setPredictInput({ ...predictInput, consumption: Number(e.target.value) })} className="border rounded p-2 w-full md:w-auto" />
-          <input type="number" placeholder={t("predict.billed")} value={predictInput.billed} onChange={(e) => setPredictInput({ ...predictInput, billed: Number(e.target.value) })} className="border rounded p-2 w-full md:w-auto" />
-          <select value={predictInput.category} onChange={(e) => setPredictInput({ ...predictInput, category: e.target.value })} className="border rounded p-2">
-            <option>Residential</option>
-            <option>Commercial</option>
-            <option>Industrial</option>
-          </select>
-          <button onClick={handlePredict} className="px-3 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700">{t("predict.button")}</button>
-        </div>
-        {predictResult && <pre className="bg-gray-100 dark:bg-gray-900 p-2 rounded text-xs overflow-auto">{JSON.stringify(predictResult, null, 2)}</pre>}
-      </div>
-
-      <button onClick={() => setCopilotOpen((s) => !s)} className={`fixed bottom-6 right-6 w-14 h-14 rounded-full flex items-center justify-center shadow-2xl text-3xl transition-all duration-300 z-50 ${copilotOpen ? "bg-gradient-to-r from-pink-500 to-purple-500 scale-110" : "bg-gradient-to-r from-indigo-500 to-blue-600 hover:scale-105"} text-white`}>
-        {copilotOpen ? "💬" : "🤖"}
-      </button>
-
-      {copilotOpen && (
-        <div className="backdrop-blur-xl bg-white/80 dark:bg-gray-900/80 border border-white/10 shadow-2xl rounded-2xl w-[min(480px,90vw)] max-h-[75vh] flex flex-col overflow-hidden animate-fade-in transition-all fixed bottom-24 right-6 z-50">
-          <div className="flex justify-between items-center px-4 py-3 bg-gradient-to-r from-indigo-500 to-blue-600 text-white">
-            <div className="flex items-center gap-2 font-semibold">
-              <span className="text-xl">⚡</span>
-              <span>{t("copilot.title")}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <button onClick={() => setAudioEnabled((s) => !s)} title={audioEnabled ? t("copilot.audio_on") : t("copilot.audio_off")} className={`text-lg transition ${audioEnabled ? "opacity-100" : "opacity-50"}`}>🔊</button>
-              <button onClick={() => setCopilotOpen(false)} className="hover:rotate-90 transition text-lg">✖</button>
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 scrollbar-thin scrollbar-thumb-gray-400/40">
-            {copilotMessages.map((m, idx) => (
-              <div key={idx} className={`flex items-start gap-2 animate-fade-in ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                {m.role === "bot" && <span className="text-2xl">🤖</span>}
-                <div className={`p-3 rounded-2xl shadow-sm max-w-[75%] leading-relaxed text-sm ${m.role === "user" ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-br-none" : "bg-gray-100 dark:bg-gray-800 dark:text-gray-100 rounded-bl-none"}`}>
-                  {m.role === "bot" ? <ReactMarkdown>{m.text}</ReactMarkdown> : m.text}
+        <div className="panel-card bg-white/60 backdrop-blur-xl rounded-xl p-4">
+          <h3 className="font-semibold mb-3 text-purple-700">{t("top_flagged") || "Top flagged"}</h3>
+          <div className="space-y-3">
+            {customers.slice(0, 6).map((c) => (
+              <div key={c.customer_id} className="flex items-center justify-between py-2 border-b border-white/10 last:border-b-0 table-row-hover">
+                <div>
+                  <div className="text-sm font-medium text-purple-600 hover:underline"><a href={`/customer/${c.customer_id}`}>{c.customer_id}</a></div>
+                  <div className="text-xs opacity-70">{c.consumer_category} • {c.persistent_anomaly ? (t("repeated") || "Repeated") : (t("single_anomaly") || "One-off")}</div>
                 </div>
-                {m.role === "user" && <span className="text-xl">🧍</span>}
+                <div className="flex items-center gap-3">
+                  <Spark value={c.avg_anomaly_score} />
+                  <div className={`text-sm font-medium ${c.anomaly_label === -1 ? "text-rose-400" : "text-emerald-400"}`}>
+  {c.anomaly_label === -1
+    ? (t("status.anomalous") || "Anomalous")
+    : (t("status.normal") || "Normal")}
+</div>
+
+                </div>
               </div>
             ))}
-            {isThinking && <div className="text-xs text-gray-400 italic animate-pulse">{t("copilot.thinking")}</div>}
-            {isListening && <div className="text-xs text-red-500 animate-pulse">🎙️ {t("voice.listening")}</div>}
-            <div ref={messagesEndRef} />
-          </div>
-
-          <div className="flex items-center gap-2 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-white/70 dark:bg-gray-900/70 backdrop-blur-md">
-            <textarea rows={1} value={copilotInput} onChange={(e) => setCopilotInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void handleCopilotSend(); } else if (e.key === "Enter" && e.shiftKey) { setCopilotInput((p) => p + "\n"); } }} placeholder={t("copilot.placeholder")} className="flex-1 p-2 rounded-xl border dark:bg-gray-800 resize-none text-sm focus:ring-2 focus:ring-blue-500 transition" />
-            <button onClick={() => void handleCopilotSend()} className="bg-blue-600 hover:bg-blue-700 text-white rounded-xl p-2 transition">➤</button>
-            <button onClick={toggleVoice} className={`rounded-xl p-2 transition ${isListening ? "bg-red-500 text-white" : "bg-gray-200 dark:bg-gray-700"}`}>🎤</button>
           </div>
         </div>
-      )}
+
+        <div className="panel-card bg-white/60 backdrop-blur-xl rounded-xl p-4">
+  <div className="flex items-center justify-between mb-2">
+    <h3 className="font-semibold text-purple-700">
+      {t("quick_insights") || "Quick Insights"}
+    </h3>
+    <button
+      className="regenerate-btn"
+      onClick={() => generateQuickInsights(customers)}
+      title={t("regenerate") || "Regenerate"}
+    >
+      <RotateCcw size={16} />
+    </button>
+  </div>
+
+  <div
+  className="mt-3 text-sm rounded-lg p-3 border border-white/10 bg-white/40 dark:bg-[#1b1630]/60 transition-all duration-500 ease-in-out"
+  style={{ minHeight: "160px" }}
+>
+
+    {insightsGenerating ? (
+      <div className="shimmer-rect p-3 text-white rounded-md">
+        {t("generating_insights") || "Generating insights…"}
+      </div>
+    ) : insightsSummary ? (
+      <ReactMarkdown rehypePlugins={[rehypeRaw]}>
+        {insightsSummary}
+      </ReactMarkdown>
+    ) : (
+      <div className="text-gray-500">
+        {t("no_insights") || "No insights available"}
+      </div>
+    )}
+  </div>
+</div>
+
+      </section>
+
+      {/* Table */}
+      <section className="bg-white/60 dark:bg-[#1b1630]/70 backdrop-blur-xl rounded p-4 shadow mt-6 border border-white/10">
+
+        <div className="flex flex-wrap items-center gap-3 mb-4">
+          <div className="flex gap-1 rounded overflow-hidden bg-gray-100">
+            {(["all", "alerts", "stable"] as const).map((k) => (
+              <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm ${tab === k ? "bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white" : "text-gray-700 hover:text-purple-600 glow-tab"}`}>
+                {t(`filters.${k}`) || k.toUpperCase()}
+              </button>
+            ))}
+          </div>
+
+          <select
+  value={categoryFilter}
+  onChange={(e) => setCategoryFilter(e.target.value)}
+  className="ml-3 border rounded px-3 py-2 text-sm bg-white text-gray-700"
+>
+  {categories.map((c) => (
+    <option key={c} value={c}>
+      {c}
+    </option>
+  ))}
+</select>
+
+
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t("search.placeholder") || "Search customers or score"} className="ml-auto px-3 py-2 rounded border bg-white text-sm text-gray-700" />
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm dashboard-table rounded-lg overflow-hidden">
+
+            <thead className="bg-white/75">
+              <tr>
+                <th className="p-3 text-left">{t("table.customer") || t("customer") || "Customer"}</th>
+                <th className="p-3">{t("table.category") || t("category") || "Category"}</th>
+                <th className="p-3">{t("table.score")}</th>
+               
+                <th className="p-3">{t("table.persistent")}</th>
+                <th className="p-3">{t("table.status")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr><td colSpan={6} className="p-4 text-center">Loading…</td></tr>
+              ) : pageItems.length === 0 ? (
+                <tr><td colSpan={6} className="p-4 text-center">{t("no_results") || "No results"}</td></tr>
+              ) : (
+                pageItems.map((c) => (
+                  <tr key={c.customer_id} className="border-b border-white/10 table-row-hover">
+  <td className="p-3 text-purple-600">
+    <a href={`/customer/${c.customer_id}`}>{c.customer_id}</a>
+  </td>
+  <td className="p-3">{c.consumer_category || "—"}</td>
+  <td className="p-3">{(c.avg_anomaly_score ?? 0).toFixed(4)}</td>
+  <td className="p-3">
+    {c.persistent_anomaly ? t("general.yes") : t("general.no")}
+  </td>
+  <td
+    className={`p-3 ${
+      c.anomaly_label === -1 ? "text-rose-400" : "text-emerald-400"
+    }`}
+  >
+    {c.anomaly_label === -1
+      ? t("status.anomalous") || "Anomalous"
+      : t("status.normal") || "Normal"}
+  </td>
+</tr>
+
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex items-center justify-between mt-4">
+  <div className="text-xs text-gray-700">
+    {t("pagination.showing")}{" "}
+    {Math.min(filtered.length, (page - 1) * perPage + 1)}–
+    {Math.min(filtered.length, page * perPage)}{" "}
+    {t("pagination.of")} {filtered.length}
+  </div>
+  <div className="flex items-center gap-2">
+    <button
+      onClick={() => setPage((p) => Math.max(1, p - 1))}
+      className="px-3 py-1 rounded bg-white"
+    >
+      {t("pagination.prev")}
+    </button>
+    <div className="text-sm">{page}/{pageCount}</div>
+    <button
+      onClick={() => setPage((p) => Math.min(pageCount, p + 1))}
+      className="px-3 py-1 rounded bg-white"
+    >
+      {t("pagination.next")}
+    </button>
+  </div>
+</div>
+
+      </section>
+
+      {/* Copilot */}
+      <CopilotInner i18nLanguage={langState} />
     </div>
   );
 }
